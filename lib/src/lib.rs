@@ -8,12 +8,29 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use zeroize::{Zeroize, Zeroizing};
 
-#[derive(Clone, Copy, Debug, Zeroize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Zeroize)]
 pub enum Side {
     /// Client = Initiator
     Initiator,
     /// Server = Responder
     Responder,
+}
+
+#[derive(Clone, Debug)]
+pub enum SideConfig {
+    Client {
+        server_pubkey: Zeroizing<Vec<u8>>,
+    },
+    Server,
+}
+
+impl SideConfig {
+    fn side(&self) -> Side {
+        match self {
+            SideConfig::Client { .. } => Side::Initiator,
+            SideConfig::Server => Side::Responder,
+        }
+    }
 }
 
 lazy_static::lazy_static! {
@@ -25,7 +42,7 @@ lazy_static::lazy_static! {
 
 pub struct Config {
     pub privkey: Zeroizing<Vec<u8>>,
-    pub side: Side,
+    pub side: SideConfig,
 }
 
 pub struct Session {
@@ -109,11 +126,16 @@ type IoResLength = std::io::Result<usize>;
 
 impl Session {
     pub async fn new(mut stream: Async<TcpStream>, config: Config) -> Result<Session, Error> {
+        let mut builder = snow::Builder::new(NOISE_PARAMS.clone()).local_private_key(&config.privkey[..]);
+        if let SideConfig::Client { ref server_pubkey } = &config.side {
+            builder = builder.remote_public_key(server_pubkey);
+        }
+
         let tstate = helpers::do_handshake(
             &mut stream,
             helpers::finish_builder_with_side(
-                snow::Builder::new(NOISE_PARAMS.clone()).local_private_key(&config.privkey[..]),
-                config.side,
+                builder,
+                config.side.side(),
             )?,
         )
         .await?;
@@ -143,7 +165,7 @@ impl Session {
             snow::Builder::new(NOISE_PARAMS_REHS.clone())
                 .local_private_key(&self.config.privkey[..])
                 .remote_public_key(self.tstate.get_remote_static().unwrap()),
-            self.config.side,
+            self.config.side.side(),
         )?;
         self.tstate = helpers::do_handshake(&mut self.stream, noise).await?;
         Ok(())
