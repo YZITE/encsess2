@@ -21,8 +21,8 @@ fn distr_send(distr_in: &mpsc::UnboundedSender<DistrBlob>, origin: SocketAddr, i
 }
 
 async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
-    use std::collections::HashMap;
     use futures_util::{io::AsyncWriteExt, stream::StreamExt};
+    use std::collections::HashMap;
     let mut outputs = HashMap::<SocketAddr, DistrOutput>::new();
     loop {
         while let Some(blob) = distr_out.next().await {
@@ -59,7 +59,7 @@ async fn handle_client(
     stream: smol::Async<std::net::TcpStream>,
     peer_addr: SocketAddr,
 ) {
-    use futures_util::io::{AsyncReadExt, AsyncBufReadExt};
+    use futures_util::io::{AsyncBufReadExt, AsyncReadExt};
     eprintln!("Accepted client: {}", peer_addr);
     match yz_encsess::Session::new(stream, config).await {
         Err(x) => eprintln!("[ERROR] {}: session setup failed with: {}", peer_addr, x),

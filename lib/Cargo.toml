@@ -5,16 +5,17 @@ authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
 edition = "2018"
 
 [dependencies]
-bytes = "0.5.4"
+bytes = "0.5"
 lazy_static = "1.4"
 smol = "0.1"
+take_mut = "0.2"
 thiserror = "1.0"
 zeroize = "1.1"
 
 [dependencies.futures-util]
 version = "0.3"
 default-features = false
-features = ["io", "std"]
+features = ["io", "std", "sink"]
 
 [dependencies.snow]
 version = "0.7.0-alpha5"

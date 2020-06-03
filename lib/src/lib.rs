@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 use bytes::BytesMut;
+use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
+use futures_util::{sink::SinkExt, stream::StreamExt};
 use smol::Async;
-use std::future::Future;
 use std::net::TcpStream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -44,12 +45,9 @@ pub struct Config {
     pub side: SideConfig,
 }
 
-pub struct Session {
-    stream: Async<TcpStream>,
-    config: Config,
-    tstate: snow::TransportState,
-    buf_in: BytesMut,
-    buf_out: BytesMut,
+enum SessionState {
+    Handshake(snow::HandshakeState),
+    Transport(snow::TransportState),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,67 +59,29 @@ pub enum Error {
     Noise(#[from] snow::Error),
 }
 
-mod helpers {
-    use super::*;
-
-    pub async fn recv(stream: &mut Async<TcpStream>) -> std::io::Result<Zeroizing<Vec<u8>>> {
-        use futures_util::io::AsyncReadExt;
-        let mut lenbuf = [0u8; 2];
-        stream.read_exact(&mut lenbuf).await?;
-        let mut data = Zeroizing::new(vec![0u8; u16::from_be_bytes(lenbuf).into()]);
-        stream.read_exact(&mut data[..]).await?;
-        Ok(data)
-    }
-
-    pub async fn send(stream: &mut Async<TcpStream>, buf: &[u8]) -> std::io::Result<()> {
-        use futures_util::io::AsyncWriteExt;
-        use std::convert::TryFrom;
-        let lenbuf = u16::try_from(buf.len())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "length overflow"))?
-            .to_be_bytes();
-        stream.write_all(&lenbuf).await?;
-        stream.write_all(buf).await?;
-        Ok(())
-    }
-
-    pub fn finish_builder_with_side<'builder>(
-        builder: snow::Builder<'builder>,
-        side: Side,
-    ) -> Result<snow::HandshakeState, snow::Error> {
-        match side {
-            Side::Initiator => builder.build_initiator(),
-            Side::Responder => builder.build_responder(),
+macro_rules! pollerfwd {
+    ($x:expr) => {{
+        match futures_util::ready!($x) {
+            Ok(x) => x,
+            Err(e) => return ::std::task::Poll::Ready(Err(e)),
         }
-    }
-
-    pub async fn do_handshake(
-        stream: &mut Async<TcpStream>,
-        mut noise: snow::HandshakeState,
-    ) -> Result<snow::TransportState, Error> {
-        while !noise.is_handshake_finished() {
-            let mut tmp = [0u8; 65535];
-            if noise.is_my_turn() {
-                let len = noise
-                    .write_message(&[], &mut tmp[..])
-                    .expect("unable to create noise handshake message");
-                send(stream, &tmp[..len]).await?;
-            } else {
-                let x = recv(stream).await?;
-                noise.read_message(&x[..], &mut tmp[..])?;
-            }
-        }
-        Ok(noise.into_transport_mode()?)
-    }
-
-    pub fn trf_err2io(x: crate::Error) -> std::io::Error {
-        match x {
-            crate::Error::Io(e) => e,
-            crate::Error::Noise(e) => std::io::Error::new(std::io::ErrorKind::PermissionDenied, e),
-        }
-    }
+    }}
 }
 
+mod helpers;
+mod packet_stream;
+
+use helpers::poll_future;
 type IoResLength = std::io::Result<usize>;
+
+pub struct Session {
+    parent: packet_stream::PacketStream,
+    config: Config,
+    state: SessionState,
+
+    buf_in: BytesMut,
+    buf_out: BytesMut,
+}
 
 #[inline]
 pub fn generate_keypair() -> Result<snow::Keypair, Error> {
@@ -129,73 +89,137 @@ pub fn generate_keypair() -> Result<snow::Keypair, Error> {
 }
 
 impl Session {
-    pub async fn new(mut stream: Async<TcpStream>, config: Config) -> Result<Session, Error> {
+    pub async fn new(stream: Async<TcpStream>, config: Config) -> Result<Session, Error> {
         let mut builder =
             snow::Builder::new(NOISE_PARAMS.clone()).local_private_key(&config.privkey[..]);
         if let SideConfig::Client { ref server_pubkey } = &config.side {
             builder = builder.remote_public_key(server_pubkey);
         }
 
-        let tstate = helpers::do_handshake(
-            &mut stream,
-            helpers::finish_builder_with_side(builder, config.side.side())?,
-        )
-        .await?;
+        let state = SessionState::Handshake(helpers::finish_builder_with_side(
+            builder,
+            config.side.side(),
+        )?);
 
-        Ok(Session {
-            stream,
+        let mut this = Session {
+            parent: packet_stream::PacketStream::new(stream),
             config,
-            tstate,
+            state,
             buf_in: BytesMut::new(),
             buf_out: BytesMut::new(),
-        })
+        };
+
+        // perform handshake without code duplication
+        this.cont_pending().await?;
+
+        Ok(this)
     }
 
     #[inline]
     pub fn get_remote_static(&self) -> Option<&[u8]> {
-        self.tstate.get_remote_static()
+        match &self.state {
+            SessionState::Transport(x) => x.get_remote_static(),
+            SessionState::Handshake(x) => x.get_remote_static(),
+        }
     }
 
     async fn cont_pending(&mut self) -> Result<(), Error> {
         const MAX_NONCE_VALUE: u64 = 10;
-        if std::cmp::max(self.tstate.sending_nonce(), self.tstate.receiving_nonce())
-            < MAX_NONCE_VALUE
-        {
-            return Ok(());
+
+        // perform all state transitions
+        let config = &self.config;
+        loop {
+            take_mut::take(&mut self.state, |state| match state {
+                SessionState::Transport(tr) => {
+                    if std::cmp::max(tr.sending_nonce(), tr.receiving_nonce()) < MAX_NONCE_VALUE {
+                        SessionState::Transport(tr)
+                    } else {
+                        SessionState::Handshake(
+                            helpers::finish_builder_with_side(
+                                snow::Builder::new(NOISE_PARAMS_REHS.clone())
+                                    .local_private_key(&config.privkey[..])
+                                    .remote_public_key(tr.get_remote_static().unwrap()),
+                                config.side.side(),
+                            )
+                            .expect("unable to build HandshakeState"),
+                        )
+                    }
+                }
+                SessionState::Handshake(hs) => {
+                    if hs.is_handshake_finished() {
+                        SessionState::Transport(
+                            hs.into_transport_mode()
+                                .expect("unable to build TransportState"),
+                        )
+                    } else {
+                        SessionState::Handshake(hs)
+                    }
+                }
+            });
+
+            // we can now deal with a state which doesn't need to change
+            // this function is reentrant, because the state of our state machine is
+            // put into self.state
+
+            if let SessionState::Handshake(ref mut noise) = &mut self.state {
+                // any `.await?` might yield and nuke `tmp`
+                let mut tmp = [0u8; 65535];
+                loop {
+                    // this might yield, but that's ok
+                    SinkExt::<&[u8]>::flush(&mut self.parent).await?;
+                    if noise.is_handshake_finished() {
+                        break;
+                    } else if noise.is_my_turn() {
+                        let len = noise
+                            .write_message(&[], &mut tmp[..])
+                            .expect("unable to create noise handshake message");
+                        // this might yield if err, but the item won't get lost
+                        self.parent.start_send_unpin(&tmp[..len])?;
+                    } else if let Some(x) = self.parent.next().await {
+                        // the previous line might yield and nuke `tmp`
+                        noise.read_message(&(x?)[..], &mut tmp[..])?;
+                    }
+                }
+            } else {
+                return Ok(());
+            }
         }
-        let noise = helpers::finish_builder_with_side(
-            snow::Builder::new(NOISE_PARAMS_REHS.clone())
-                .local_private_key(&self.config.privkey[..])
-                .remote_public_key(self.tstate.get_remote_static().unwrap()),
-            self.config.side.side(),
-        )?;
-        self.tstate = helpers::do_handshake(&mut self.stream, noise).await?;
-        Ok(())
     }
 
     async fn helper_read(&mut self) -> Result<(), Error> {
-        if self.buf_in.is_empty() {
-            self.cont_pending().await?;
-            let blob = helpers::recv(&mut self.stream).await?;
-            self.buf_in.resize(65535, 0);
-            let len = self.tstate.read_message(&blob[..], &mut self.buf_in[..])?;
-            self.buf_in.truncate(len);
+        if !self.buf_in.is_empty() {
+            return Ok(());
+        }
+        self.cont_pending().await?;
+        let parent = &mut self.parent;
+        let buf_in = &mut self.buf_in;
+        if let SessionState::Transport(ref mut tr) = &mut self.state {
+            if let Some(blob) = parent.next().await {
+                buf_in.resize(65535, 0);
+                let len = tr.read_message(&(blob?)[..], &mut buf_in[..])?;
+                buf_in.truncate(len);
+            }
         }
         Ok(())
     }
 
     async fn helper_write(&mut self, mut threshold: usize) -> Result<(), Error> {
         const PACKET_MAX_LEN: usize = 65535 - 16 - 1;
+        SinkExt::<&[u8]>::flush(&mut self.parent).await?;
         threshold = std::cmp::min(threshold, PACKET_MAX_LEN - 1);
         while self.buf_out.len() > threshold {
+            // cont_pending calls flush if necessary
             self.cont_pending().await?;
-            let mut tmp = [0u8; 65535];
-            let inner_len = std::cmp::min(self.buf_out.len(), PACKET_MAX_LEN);
-            let len = self
-                .tstate
-                .write_message(&self.buf_out.split_to(inner_len)[..], &mut tmp[..])?;
-            helpers::send(&mut self.stream, &tmp[..len]).await?;
+            if let SessionState::Transport(ref mut tr) = &mut self.state {
+                let mut tmp = [0u8; 65535];
+                let inner_len = std::cmp::min(self.buf_out.len(), PACKET_MAX_LEN);
+                let len = tr.write_message(&self.buf_out.split_to(inner_len)[..], &mut tmp[..])?;
+                // this only works because we know about the PacketStream interna
+                // because otherwise it violates the Sink interface
+                self.parent.start_send_unpin(&tmp[..len])?;
+            }
         }
+        SinkExt::<&[u8]>::flush(&mut self.parent).await?;
         Ok(())
     }
 
@@ -209,46 +233,7 @@ impl Session {
     }
 }
 
-// shamelessly stolen from `crate smol`
-fn poll_future<T>(cx: &mut Context<'_>, fut: impl Future<Output = T>) -> Poll<T> {
-    futures_util::pin_mut!(fut);
-    fut.poll(cx)
-}
-
-impl futures_util::io::AsyncRead for Session {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<IoResLength> {
-        poll_future(cx, async move {
-            let this = self.get_mut();
-            this.helper_read().await.map_err(helpers::trf_err2io)?;
-            let len = std::cmp::min(buf.len(), this.buf_in.len());
-            buf.copy_from_slice(&this.buf_in.split_to(len)[..]);
-            Ok(len)
-        })
-    }
-
-    fn poll_read_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &mut [std::io::IoSliceMut<'_>],
-    ) -> Poll<IoResLength> {
-        poll_future(cx, async move {
-            let this = self.get_mut();
-            let mut ret_len = 0usize;
-            for i in bufs.iter_mut() {
-                this.helper_read().await.map_err(helpers::trf_err2io)?;
-                let len = std::cmp::min(i.len(), this.buf_in.len());
-                if len == 0 {
-                    break;
-                }
-                i.copy_from_slice(&this.buf_in.split_to(len)[..]);
-                ret_len += len;
-            }
-            Ok(ret_len)
-        })
-    }
-}
-
-impl futures_util::io::AsyncBufRead for Session {
+impl AsyncBufRead for Session {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
         poll_future(cx, async move {
             let this = self.get_mut();
@@ -262,7 +247,17 @@ impl futures_util::io::AsyncBufRead for Session {
     }
 }
 
-impl futures_util::io::AsyncWrite for Session {
+impl AsyncRead for Session {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<IoResLength> {
+        let mybuf = pollerfwd!(self.as_mut().poll_fill_buf(cx));
+        let len = std::cmp::min(buf.len(), mybuf.len());
+        buf.copy_from_slice(&mybuf[..len]);
+        self.consume(len);
+        Poll::Ready(Ok(len))
+    }
+}
+
+impl AsyncWrite for Session {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResLength> {
         poll_future(cx, self.real_write(buf))
     }
@@ -297,7 +292,10 @@ impl futures_util::io::AsyncWrite for Session {
     }
 
     #[inline]
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Self::poll_flush(self, cx)
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        poll_future(cx, async {
+            self.flush().await?;
+            SinkExt::<&[u8]>::close(&mut self.parent).await
+        })
     }
 }

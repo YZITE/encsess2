@@ -7,11 +7,14 @@ edition = "2018"
 [dependencies]
 base64 = "0.12"
 clap = "2.33"
-futures-util = "0.3"
 smol = "0.1"
 yz-encsess = { path = "../lib" }
 futures-channel = "0.3.5"
 ctrlc = "3.1.4"
+
+[dependencies.futures-util]
+version = "0.3"
+features = ["unstable", "bilock"]
 
 [dependencies.smol-potat]
 version = "0.3"
