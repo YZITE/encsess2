@@ -1,10 +1,10 @@
+use crate::helpers::poll_future;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures_util::{io::AsyncWrite, pin_mut, sink::Sink, stream::Stream};
 use smol::Async;
 use std::net::TcpStream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use crate::helpers::poll_future;
-use futures_util::{pin_mut, sink::Sink, stream::Stream, io::AsyncWrite};
 
 pub struct PacketStream {
     stream: Async<TcpStream>,

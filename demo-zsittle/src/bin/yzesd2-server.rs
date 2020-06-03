@@ -1,9 +1,10 @@
 #![forbid(deprecated, unsafe_code)]
 
 use futures_channel::mpsc;
+use futures_util::lock::BiLock;
 use std::net::SocketAddr;
 
-type DistrOutput = futures_util::io::WriteHalf<yz_encsess::Session>;
+type DistrOutput = BiLock<yz_encsess::Session>;
 
 enum DistrInner {
     Connect(DistrOutput),
@@ -29,8 +30,8 @@ async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
             let DistrBlob { origin, inner } = blob;
             match inner {
                 DistrInner::Disconnect => {
-                    if let Some(mut outp) = outputs.remove(&origin) {
-                        let _ = outp.flush().await;
+                    if let Some(outp) = outputs.remove(&origin) {
+                        let _ = outp.lock().await.flush().await;
                     }
                 }
                 DistrInner::Connect(wr) => {
@@ -41,8 +42,8 @@ async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
                     print!("{}", msg);
                     let mut new_outputs = HashMap::new();
                     new_outputs.reserve(outputs.len());
-                    for (k, mut v) in std::mem::take(&mut outputs) {
-                        if k == origin || v.write_all(msg.as_bytes()).await.is_ok() {
+                    for (k, v) in std::mem::take(&mut outputs) {
+                        if k == origin || v.lock().await.write_all(msg.as_bytes()).await.is_ok() {
                             new_outputs.insert(k, v);
                         }
                     }
@@ -59,35 +60,16 @@ async fn handle_client(
     stream: smol::Async<std::net::TcpStream>,
     peer_addr: SocketAddr,
 ) {
-    use futures_util::io::{AsyncBufReadExt, AsyncReadExt};
+    use futures_util::io::AsyncBufReadExt;
     eprintln!("Accepted client: {}", peer_addr);
     match yz_encsess::Session::new(stream, config).await {
         Err(x) => eprintln!("[ERROR] {}: session setup failed with: {}", peer_addr, x),
         Ok(x) => {
-            /*
-                            tokio::spawn(async move {
-                                let mut buffer = YzeSession::get_recv_buffer();
-                                let (mut reader, writer) = x.split();
-                                distr_send(&distr_in, peer_addr, DistrInner::Connect(writer));
-                                while let Ok(blob) = reader.recv_with_buffer(&mut buffer).await {
-                                    if blob.is_empty() {
-                                        break;
-                                    }
-                                    if let Ok(line) = std::str::from_utf8(blob) {
-                                        distr_send(&distr_in, peer_addr, DistrInner::Message(line.to_string()));
-                                    }
-                                }
-                                distr_send(&distr_in, peer_addr, DistrInner::Disconnect);
-                                println!("Disconnected: {}", peer_addr);
-                            });
-
-            */
-
-            smol::Task::spawn(async {
-                let (mut reader, writer) = x.split();
+            smol::Task::spawn(async move {
+                let (reader, writer) = BiLock::new(x);
                 distr_send(&distr_in, peer_addr, DistrInner::Connect(writer));
                 let mut line = String::new();
-                while reader.read_line(&mut line).is_ok() {
+                while reader.lock().await.read_line(&mut line).await.is_ok() {
                     if line.is_empty() {
                         break;
                     }
@@ -164,5 +146,5 @@ async fn main() {
     }
 
     std::mem::drop(distr_in);
-    distributor.cancel();
+    distributor.cancel().await;
 }

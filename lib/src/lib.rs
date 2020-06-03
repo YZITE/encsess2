@@ -65,7 +65,7 @@ macro_rules! pollerfwd {
             Ok(x) => x,
             Err(e) => return ::std::task::Poll::Ready(Err(e)),
         }
-    }}
+    }};
 }
 
 mod helpers;
@@ -248,7 +248,11 @@ impl AsyncBufRead for Session {
 }
 
 impl AsyncRead for Session {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<IoResLength> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<IoResLength> {
         let mybuf = pollerfwd!(self.as_mut().poll_fill_buf(cx));
         let len = std::cmp::min(buf.len(), mybuf.len());
         buf.copy_from_slice(&mybuf[..len]);
