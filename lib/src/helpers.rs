@@ -3,8 +3,8 @@ use std::task::{Context, Poll};
 
 use super::Side;
 
-pub fn finish_builder_with_side<'builder>(
-    builder: snow::Builder<'builder>,
+pub fn finish_builder_with_side(
+    builder: snow::Builder<'_>,
     side: Side,
 ) -> Result<snow::HandshakeState, snow::Error> {
     match side {
