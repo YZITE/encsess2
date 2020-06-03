@@ -266,26 +266,6 @@ impl AsyncWrite for Session {
         poll_future(cx, self.real_write(buf))
     }
 
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<IoResLength> {
-        poll_future(cx, async move {
-            let this = self.get_mut();
-            let mut ret_len = 0usize;
-            for i in bufs.iter() {
-                this.buf_out.extend_from_slice(&(*i)[..]);
-                this.helper_write(usize::MAX)
-                    .await
-                    .map_err(helpers::trf_err2io)?;
-                ret_len += i.len();
-            }
-            this.real_write(&[]).await?;
-            Ok(ret_len)
-        })
-    }
-
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         poll_future(cx, async move {
             self.get_mut()
