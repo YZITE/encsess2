@@ -18,9 +18,7 @@ pub enum Side {
 
 #[derive(Clone, Debug)]
 pub enum SideConfig {
-    Client {
-        server_pubkey: Zeroizing<Vec<u8>>,
-    },
+    Client { server_pubkey: Zeroizing<Vec<u8>> },
     Server,
 }
 
@@ -40,6 +38,7 @@ lazy_static::lazy_static! {
       = "Noise_KK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
 }
 
+#[derive(Clone, Debug)]
 pub struct Config {
     pub privkey: Zeroizing<Vec<u8>>,
     pub side: SideConfig,
@@ -124,19 +123,22 @@ mod helpers {
 
 type IoResLength = std::io::Result<usize>;
 
+#[inline]
+pub fn generate_keypair() -> Result<snow::Keypair, Error> {
+    Ok(snow::Builder::new(NOISE_PARAMS.clone()).generate_keypair()?)
+}
+
 impl Session {
     pub async fn new(mut stream: Async<TcpStream>, config: Config) -> Result<Session, Error> {
-        let mut builder = snow::Builder::new(NOISE_PARAMS.clone()).local_private_key(&config.privkey[..]);
+        let mut builder =
+            snow::Builder::new(NOISE_PARAMS.clone()).local_private_key(&config.privkey[..]);
         if let SideConfig::Client { ref server_pubkey } = &config.side {
             builder = builder.remote_public_key(server_pubkey);
         }
 
         let tstate = helpers::do_handshake(
             &mut stream,
-            helpers::finish_builder_with_side(
-                builder,
-                config.side.side(),
-            )?,
+            helpers::finish_builder_with_side(builder, config.side.side())?,
         )
         .await?;
 
@@ -243,6 +245,20 @@ impl futures_util::io::AsyncRead for Session {
             }
             Ok(ret_len)
         })
+    }
+}
+
+impl futures_util::io::AsyncBufRead for Session {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
+        poll_future(cx, async move {
+            let this = self.get_mut();
+            this.helper_read().await.map_err(helpers::trf_err2io)?;
+            Ok(&this.buf_in[..])
+        })
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let _ = self.get_mut().buf_in.split_to(amt);
     }
 }
 
