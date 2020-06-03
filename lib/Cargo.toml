@@ -1,5 +1,5 @@
 [package]
-name = "yz-encsess2"
+name = "yz-encsess"
 version = "0.1.0"
 authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
 edition = "2018"

@@ -1,0 +1,11 @@
+[package]
+name = "yzesd-zsittle"
+version = "0.1.0"
+authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
+edition = "2018"
+
+[dependencies]
+clap = "2.33"
+smol = "0.1"
+smol-potat = "0.3"
+yz-encsess = { path = "../lib" }

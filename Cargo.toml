@@ -1,0 +1,8 @@
+[workspace]
+members = [
+  "lib",
+  "demo-zsittle",
+]
+
+[profile.release]
+panic = "abort"
