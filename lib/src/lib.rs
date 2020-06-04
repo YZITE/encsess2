@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Zeroize)]
-pub enum Side {
+enum Side {
     /// Client = Initiator
     Initiator,
     /// Server = Responder
@@ -175,9 +175,17 @@ impl Session {
                             .expect("unable to create noise handshake message");
                         // this might yield if err, but the item won't get lost
                         self.parent.start_send_unpin(&tmp[..len])?;
-                    } else if let Some(x) = self.parent.next().await {
-                        // the previous line might yield and nuke `tmp`
-                        noise.read_message(&(x?)[..], &mut tmp[..])?;
+                    } else {
+                        // this line might yield and nuke `tmp`
+                        let _ = match self.parent.next().await {
+                            Some(x) => noise.read_message(&(x?)[..], &mut tmp[..])?,
+                            None => {
+                                return Err(Error::Io(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "eof while handshaking",
+                                )))
+                            }
+                        };
                     }
                 }
             } else {
@@ -196,7 +204,12 @@ impl Session {
         if let SessionState::Transport(ref mut tr) = &mut self.state {
             if let Some(blob) = parent.next().await {
                 buf_in.resize(65535, 0);
-                let len = tr.read_message(&(blob?)[..], &mut buf_in[..])?;
+                let len = tr
+                    .read_message(&(blob?)[..], &mut buf_in[..])
+                    .map_err(|x| {
+                        buf_in.clear();
+                        x
+                    })?;
                 buf_in.truncate(len);
             }
         }
@@ -242,6 +255,7 @@ impl AsyncBufRead for Session {
         })
     }
 
+    #[inline]
     fn consume(self: Pin<&mut Self>, amt: usize) {
         let _ = self.get_mut().buf_in.split_to(amt);
     }
@@ -255,13 +269,14 @@ impl AsyncRead for Session {
     ) -> Poll<IoResLength> {
         let mybuf = pollerfwd!(self.as_mut().poll_fill_buf(cx));
         let len = std::cmp::min(buf.len(), mybuf.len());
-        buf.copy_from_slice(&mybuf[..len]);
+        buf[..len].copy_from_slice(&mybuf[..len]);
         self.consume(len);
         Poll::Ready(Ok(len))
     }
 }
 
 impl AsyncWrite for Session {
+    #[inline]
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResLength> {
         poll_future(cx, self.real_write(buf))
     }
@@ -275,7 +290,6 @@ impl AsyncWrite for Session {
         })
     }
 
-    #[inline]
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         poll_future(cx, async {
             self.flush().await?;

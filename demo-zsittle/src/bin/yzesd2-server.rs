@@ -3,6 +3,8 @@
 use futures_channel::mpsc;
 use futures_util::lock::BiLock;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 type DistrOutput = BiLock<yz_encsess::Session>;
 
@@ -19,6 +21,79 @@ struct DistrBlob {
 
 fn distr_send(distr_in: &mpsc::UnboundedSender<DistrBlob>, origin: SocketAddr, inner: DistrInner) {
     let _ = distr_in.unbounded_send(DistrBlob { origin, inner });
+}
+
+struct CustomReadUntil<'a> {
+    lock: &'a DistrOutput,
+    bytes: &'a mut Vec<u8>,
+    until_byte: u8,
+}
+
+fn read_until_internal<R: futures_util::io::AsyncBufRead + ?Sized>(
+    mut reader: Pin<&mut R>,
+    cx: &mut Context<'_>,
+    byte: u8,
+    buf: &mut Vec<u8>,
+    read: &mut usize,
+) -> Poll<std::io::Result<usize>> {
+    loop {
+        let (done, used) = {
+            let available = futures_util::ready!(reader.as_mut().poll_fill_buf(cx))?;
+            if let Some(i) = memchr::memchr(byte, available) {
+                buf.extend_from_slice(&available[..=i]);
+                (true, i + 1)
+            } else {
+                buf.extend_from_slice(available);
+                (false, available.len())
+            }
+        };
+        reader.as_mut().consume(used);
+        *read += used;
+        if done || used == 0 {
+            return Poll::Ready(Ok(std::mem::replace(read, 0)));
+        }
+    }
+}
+
+impl<'a> std::future::Future for CustomReadUntil<'a> {
+    type Output = std::io::Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        use futures_util::ready;
+        let this = Pin::into_inner(self);
+        let mut l = ready!(this.lock.poll_lock(cx));
+        let mut rcnt = 0;
+        let ret = ready!(read_until_internal(
+            l.as_pin_mut(),
+            cx,
+            this.until_byte,
+            this.bytes,
+            &mut rcnt
+        ));
+        Poll::Ready(ret.map(|_| ()))
+    }
+}
+
+#[inline]
+async fn locked_read_until(
+    lock: &DistrOutput,
+    bytes: &mut Vec<u8>,
+    until_byte: u8,
+) -> std::io::Result<()> {
+    CustomReadUntil {
+        lock,
+        bytes,
+        until_byte,
+    }
+    .await
+}
+
+async fn write_and_flush(v: &DistrOutput, msg: &str) -> std::io::Result<()> {
+    use futures_util::io::AsyncWriteExt;
+    let mut l = v.lock().await;
+    l.write_all(msg.as_bytes()).await?;
+    l.flush().await?;
+    Ok(())
 }
 
 async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
@@ -43,7 +118,7 @@ async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
                     let mut new_outputs = HashMap::new();
                     new_outputs.reserve(outputs.len());
                     for (k, v) in std::mem::take(&mut outputs) {
-                        if k == origin || v.lock().await.write_all(msg.as_bytes()).await.is_ok() {
+                        if k == origin || write_and_flush(&v, &msg).await.is_ok() {
                             new_outputs.insert(k, v);
                         }
                     }
@@ -60,7 +135,6 @@ async fn handle_client(
     stream: smol::Async<std::net::TcpStream>,
     peer_addr: SocketAddr,
 ) {
-    use futures_util::io::AsyncBufReadExt;
     eprintln!("Accepted client: {}", peer_addr);
     match yz_encsess::Session::new(stream, config).await {
         Err(x) => eprintln!("[ERROR] {}: session setup failed with: {}", peer_addr, x),
@@ -68,18 +142,21 @@ async fn handle_client(
             smol::Task::spawn(async move {
                 let (reader, writer) = BiLock::new(x);
                 distr_send(&distr_in, peer_addr, DistrInner::Connect(writer));
-                let mut line = String::new();
-                while reader.lock().await.read_line(&mut line).await.is_ok() {
+                let mut line = Vec::new();
+                while locked_read_until(&reader, &mut line, b'\n').await.is_ok() {
                     if line.is_empty() {
                         break;
                     }
-                    if line.ends_with('\n') {
+                    if line.ends_with(&[b'\n']) {
                         line.pop();
                     }
                     distr_send(
                         &distr_in,
                         peer_addr,
-                        DistrInner::Message(std::mem::take(&mut line)),
+                        DistrInner::Message(
+                            String::from_utf8(std::mem::take(&mut line))
+                                .expect("got invalid utf-8"),
+                        ),
                     );
                 }
                 distr_send(&distr_in, peer_addr, DistrInner::Disconnect);
@@ -94,6 +171,7 @@ async fn handle_client(
 async fn main() {
     use clap::Arg;
     use futures_util::{future::FutureExt, stream::StreamExt};
+    tracing_subscriber::fmt::init();
 
     let matches = clap::App::new("yzesd-server")
         .version(clap::crate_version!())

@@ -2,6 +2,8 @@
 
 fn main() {
     use clap::Arg;
+    tracing_subscriber::fmt::init();
+
     let matches = clap::App::new("yzesd-client")
         .version(clap::crate_version!())
         .author("Erik Zscheile <zseri.devel@ytrizja.de>")
@@ -43,18 +45,29 @@ fn main() {
                 .await
                 .expect("unable to connect TCP stream");
 
-        use futures_util::io::{self, AsyncReadExt};
+        use futures_util::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let sess = yz_encsess::Session::new(stream, config)
             .await
             .expect("unable to establish session");
         let (srd, mut swr) = sess.split();
 
         // Create async stdin and stdout handles.
-        let stdin = smol::reader(std::io::stdin());
+        let mut stdin = futures_util::io::BufReader::new(smol::reader(std::io::stdin()));
         let mut stdout = smol::writer(std::io::stdout());
 
-        futures_util::future::try_join(io::copy(stdin, &mut swr), io::copy(srd, &mut stdout))
-            .await
-            .expect("I/O error");
+        futures_util::future::try_join(
+            async move {
+                let mut line = String::new();
+                while stdin.read_line(&mut line).await.is_ok() {
+                    swr.write_all(line.as_bytes()).await?;
+                    line.clear();
+                    swr.flush().await?;
+                }
+                Ok(())
+            },
+            io::copy(srd, &mut stdout),
+        )
+        .await
+        .expect("I/O error");
     });
 }

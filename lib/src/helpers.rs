@@ -3,7 +3,7 @@ use std::task::{Context, Poll};
 
 use super::Side;
 
-pub fn finish_builder_with_side(
+pub(crate) fn finish_builder_with_side(
     builder: snow::Builder<'_>,
     side: Side,
 ) -> Result<snow::HandshakeState, snow::Error> {

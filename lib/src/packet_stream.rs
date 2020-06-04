@@ -44,6 +44,7 @@ impl PacketStream {
             // assumption: `read` only yields if it has not read (and dropped) anything yet.
             use futures_util::io::AsyncReadExt;
             let len = self.stream.read(&mut rdbuf).await?;
+            tracing::debug!("received {} bytes", len);
             if len == 0 {
                 return Ok(None);
             }
@@ -60,6 +61,7 @@ impl PacketStream {
             // data two times, and thus invalidating the data stream
             // assumption: `write` only yields if it has not written anything yet.
             let len = self.stream.write(&self.buf_out[..]).await?;
+            tracing::debug!("sent {} bytes", len);
             // drop written part
             let _ = self.buf_out.split_to(len);
         }
