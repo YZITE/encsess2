@@ -221,6 +221,7 @@ impl Session {
         const PACKET_MAX_LEN: usize = 65535 - 16 - 1;
         let threshold = if do_full_flush { 0 } else { PACKET_MAX_LEN - 1 };
         let mut sent_new_data = false;
+        tracing::debug!("buffered output len = {}; do full flush = {}", self.buf_out.len(), do_full_flush);
         while self.buf_out.len() > threshold {
             // cont_pending calls flush if necessary
             self.cont_pending().await?;
