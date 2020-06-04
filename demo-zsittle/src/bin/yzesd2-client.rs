@@ -59,6 +59,7 @@ fn main() {
             async move {
                 let mut line = String::new();
                 while stdin.read_line(&mut line).await.is_ok() {
+                    tracing::debug!("line length = {}", line.len());
                     swr.write_all(line.as_bytes()).await?;
                     line.clear();
                     swr.flush().await?;
