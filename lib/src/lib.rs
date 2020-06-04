@@ -39,6 +39,8 @@ lazy_static::lazy_static! {
       = "Noise_KK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
 }
 
+const MAX_U16LEN: usize = 0xffff;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub privkey: Zeroizing<Vec<u8>>,
@@ -163,7 +165,7 @@ impl Session {
 
             if let SessionState::Handshake(ref mut noise) = &mut self.state {
                 // any `.await?` might yield and nuke `tmp`
-                let mut tmp = [0u8; 65535];
+                let mut tmp = [0u8; MAX_U16LEN];
                 loop {
                     // this might yield, but that's ok
                     SinkExt::<&[u8]>::flush(&mut self.parent).await?;
@@ -203,7 +205,7 @@ impl Session {
         let buf_in = &mut self.buf_in;
         if let SessionState::Transport(ref mut tr) = &mut self.state {
             if let Some(blob) = parent.next().await {
-                buf_in.resize(65535, 0);
+                buf_in.resize(MAX_U16LEN, 0);
                 let len = tr
                     .read_message(&(blob?)[..], &mut buf_in[..])
                     .map_err(|x| {
@@ -230,7 +232,7 @@ impl Session {
 
     async fn helper_write(&mut self, do_full_flush: bool) -> Result<(), Error> {
         // we know about the PacketStream interna and know we don't need to wait for readyness.
-        const PACKET_MAX_LEN: usize = 65535 - 20 - 1;
+        const PACKET_MAX_LEN: usize = MAX_U16LEN - 20 - 1;
         const PAD_TRG_SIZE: usize = 64;
         let threshold = if do_full_flush { 0 } else { PACKET_MAX_LEN - 1 };
         let mut sent_new_data = false;
@@ -245,12 +247,11 @@ impl Session {
             self.cont_pending().await?;
             if let SessionState::Transport(ref mut tr) = &mut self.state {
                 use {bytes::BufMut, std::convert::TryInto};
-                let mut tmp = [0u8; 65535];
                 let inner_len = std::cmp::min(self.buf_out.len(), PACKET_MAX_LEN);
                 let wopad_len = inner_len + 2;
                 // padding prefix (20) = 16 (AEAD meta) + 2 (packet length) + 2 (non-padding length)
                 let mut padding_len = PAD_TRG_SIZE - ((20 + inner_len) % PAD_TRG_SIZE);
-                if (wopad_len + padding_len) > u16::MAX.into() {
+                if (wopad_len + padding_len) > MAX_U16LEN {
                     assert!(padding_len > 0);
                     padding_len -= 1;
                 }
@@ -262,6 +263,7 @@ impl Session {
                 inner_full.extend_from_slice(&self.buf_out[..inner_len]);
                 inner_full.resize(wopad_len + padding_len, 0);
                 rand::RngCore::fill_bytes(&mut thrng, &mut inner_full[wopad_len..]);
+                let mut tmp = [0u8; MAX_U16LEN];
                 let len = tr.write_message(&inner_full[..], &mut tmp[..])?;
                 // this only works because we know about the PacketStream interna
                 // because otherwise it violates the Sink interface
