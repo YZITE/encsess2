@@ -89,20 +89,18 @@ impl<B: AsRef<[u8]>> Sink<B> for PacketStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
         let this = Pin::into_inner(self);
         let buf_out = &mut this.buf_out;
+        let stream = &mut this.stream;
+        pin_mut!(stream);
         // this part is easier... we just need to wait until all data is written
         while !buf_out.is_empty() {
             // every call to `write` might yield, and we must be sure to not send
             // data two times, and thus invalidating the data stream
             // assumption: `write` only yields if it has not written anything yet
-            let stream = &mut this.stream;
-            pin_mut!(stream);
-            let len = pollerfwd!(stream.poll_write(cx, &buf_out[..]));
+            let len = pollerfwd!(stream.as_mut().poll_write(cx, &buf_out[..]));
             tracing::debug!("sent {} bytes", len);
             // drop written part
             buf_out.advance(len);
         }
-        let stream = &mut this.stream;
-        pin_mut!(stream);
         stream.poll_flush(cx)
     }
 

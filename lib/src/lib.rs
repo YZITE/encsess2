@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use bytes::{Buf, BytesMut};
-use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
+use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use smol::Async;
 use std::net::TcpStream;
@@ -201,10 +201,9 @@ impl Session {
             return Ok(());
         }
         self.cont_pending().await?;
-        let parent = &mut self.parent;
         let buf_in = &mut self.buf_in;
         if let SessionState::Transport(ref mut tr) = &mut self.state {
-            if let Some(blob) = parent.next().await {
+            if let Some(blob) = self.parent.next().await {
                 buf_in.resize(MAX_U16LEN, 0);
                 let len = tr
                     .read_message(&(blob?)[..], &mut buf_in[..])
@@ -281,16 +280,14 @@ impl Session {
 
 impl AsyncBufRead for Session {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
-        poll_future(cx, async move {
-            let this = self.get_mut();
-            this.helper_read().await.map_err(helpers::trf_err2io)?;
-            Ok(&this.buf_in[..])
-        })
+        let this = self.get_mut();
+        pollerfwd!(poll_future(cx, this.helper_read()).map(|x| x.map_err(helpers::trf_err2io)));
+        Poll::Ready(Ok(&this.buf_in[..]))
     }
 
     #[inline]
-    fn consume(self: Pin<&mut Self>, amt: usize) {
-        self.get_mut().buf_in.advance(amt)
+    fn consume(mut self: Pin<&mut Self>, amt: usize) {
+        self.buf_in.advance(amt)
     }
 }
 
@@ -310,30 +307,22 @@ impl AsyncRead for Session {
 
 impl AsyncWrite for Session {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResLength> {
-        poll_future(cx, async move {
-            self.helper_write(false)
-                .await
-                .map_err(helpers::trf_err2io)?;
-            // we can't simply do this before the partial flush,
-            // because we can't 'roll back' in case of yielding or error
-            self.buf_out.extend_from_slice(buf);
-            Ok(buf.len())
-        })
+        pollerfwd!(poll_future(cx, self.as_mut().helper_write(false))
+            .map(|x| x.map_err(helpers::trf_err2io)));
+        // we can't simply do this before the partial flush,
+        // because we can't 'roll back' in case of yielding or error
+        self.buf_out.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        poll_future(cx, async move {
-            self.get_mut()
-                .helper_write(true)
-                .await
-                .map_err(helpers::trf_err2io)
-        })
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        poll_future(cx, self.helper_write(true)).map(|x| x.map_err(helpers::trf_err2io))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        poll_future(cx, async {
-            self.flush().await?;
-            SinkExt::<&[u8]>::close(&mut self.parent).await
-        })
+        pollerfwd!(self.as_mut().poll_flush(cx));
+        let parent = &mut self.parent;
+        futures_util::pin_mut!(parent);
+        futures_util::sink::Sink::<&[u8]>::poll_close(parent, cx)
     }
 }
