@@ -22,63 +22,43 @@ impl PacketStream {
             in_xpdlen: None,
         }
     }
-
-    async fn recv(&mut self) -> std::io::Result<Option<Bytes>> {
-        loop {
-            if self.buf_in.len() >= 2 && self.in_xpdlen.is_none() {
-                self.in_xpdlen = Some(self.buf_in.get_u16().into());
-            }
-            if let Some(expect_len) = self.in_xpdlen {
-                if self.buf_in.len() >= expect_len {
-                    // we are done, if we reach this,
-                    // the length spec was already removed from buf_xin
-                    self.in_xpdlen = None;
-                    return Ok(Some(self.buf_in.split_to(expect_len).freeze()));
-                }
-            }
-
-            // we need more data
-            let mut rdbuf = [0u8; 8192];
-            // the `read` might yield, and it should not leave any part of
-            // `self` in an invalid state
-            // assumption: `read` only yields if it has not read (and dropped) anything yet.
-            use futures_util::io::AsyncReadExt;
-            let len = self.stream.read(&mut rdbuf).await?;
-            tracing::debug!("received {} bytes", len);
-            if len == 0 {
-                return Ok(None);
-            }
-            self.buf_in.extend_from_slice(&rdbuf[..len]);
-        }
-    }
-
-    /// you can call this function alternatively to `poll_ready`
-    async fn flush_and_ready(&mut self) -> std::io::Result<()> {
-        use futures_util::io::AsyncWriteExt;
-        // this part is easier... we just need to wait until all data is written
-        while !self.buf_out.is_empty() {
-            // every call to `write` might yield, and we must be sure to not send
-            // data two times, and thus invalidating the data stream
-            // assumption: `write` only yields if it has not written anything yet.
-            let len = self.stream.write(&self.buf_out[..]).await?;
-            tracing::debug!("sent {} bytes", len);
-            // drop written part
-            let _ = self.buf_out.split_to(len);
-        }
-        self.stream.flush().await?;
-        Ok(())
-    }
 }
 
 impl Stream for PacketStream {
     type Item = std::io::Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = Pin::into_inner(self);
         poll_future(cx, async move {
-            match self.get_mut().recv().await {
-                Ok(o) => o.map(Ok),
-                Err(e) => Some(Err(e)),
+            loop {
+                if this.buf_in.len() >= 2 && this.in_xpdlen.is_none() {
+                    this.in_xpdlen = Some(this.buf_in.get_u16().into());
+                }
+                if let Some(expect_len) = this.in_xpdlen {
+                    if this.buf_in.len() >= expect_len {
+                        // we are done, if we reach this,
+                        // the length spec was already removed from buf_xin
+                        this.in_xpdlen = None;
+                        return Ok(Some(this.buf_in.split_to(expect_len).freeze()));
+                    }
+                }
+                // we need more data
+                let mut rdbuf = [0u8; 8192];
+                // the `read` might yield, and it should not leave any part of
+                // `this` in an invalid state
+                // assumption: `read` only yields if it has not read (and dropped) anything yet.
+                use futures_util::io::AsyncReadExt;
+                let len = this.stream.read(&mut rdbuf).await?;
+                tracing::debug!("received {} bytes", len);
+                if len == 0 {
+                    return Ok(None);
+                }
+                this.buf_in.extend_from_slice(&rdbuf[..len]);
             }
+        })
+        .map(|ret| match ret {
+            Ok(o) => o.map(Ok),
+            Err(e) => Some(Err(e)),
         })
     }
 }
@@ -106,9 +86,24 @@ impl<B: AsRef<[u8]>> Sink<B> for PacketStream {
         Ok(())
     }
 
-    #[inline]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
-        poll_future(cx, self.get_mut().flush_and_ready())
+        let this = Pin::into_inner(self);
+        let buf_out = &mut this.buf_out;
+        // this part is easier... we just need to wait until all data is written
+        while !buf_out.is_empty() {
+            // every call to `write` might yield, and we must be sure to not send
+            // data two times, and thus invalidating the data stream
+            // assumption: `write` only yields if it has not written anything yet
+            let stream = &mut this.stream;
+            pin_mut!(stream);
+            let len = pollerfwd!(stream.poll_write(cx, &buf_out[..]));
+            tracing::debug!("sent {} bytes", len);
+            // drop written part
+            let _ = buf_out.split_to(len);
+        }
+        let stream = &mut this.stream;
+        pin_mut!(stream);
+        stream.poll_flush(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {

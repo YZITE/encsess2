@@ -216,10 +216,11 @@ impl Session {
         Ok(())
     }
 
-    async fn helper_write(&mut self, mut threshold: usize) -> Result<(), Error> {
+    async fn helper_write(&mut self, do_full_flush: bool) -> Result<(), Error> {
+        // we know about the PacketStream interna and know we don't need to wait for readyness.
         const PACKET_MAX_LEN: usize = 65535 - 16 - 1;
-        SinkExt::<&[u8]>::flush(&mut self.parent).await?;
-        threshold = std::cmp::min(threshold, PACKET_MAX_LEN - 1);
+        let threshold = if do_full_flush { 0 } else { PACKET_MAX_LEN - 1 };
+        let mut sent_new_data = false;
         while self.buf_out.len() > threshold {
             // cont_pending calls flush if necessary
             self.cont_pending().await?;
@@ -230,19 +231,13 @@ impl Session {
                 // this only works because we know about the PacketStream interna
                 // because otherwise it violates the Sink interface
                 self.parent.start_send_unpin(&tmp[..len])?;
+                sent_new_data = true;
             }
         }
-        SinkExt::<&[u8]>::flush(&mut self.parent).await?;
+        if sent_new_data {
+            SinkExt::<&[u8]>::flush(&mut self.parent).await?;
+        }
         Ok(())
-    }
-
-    async fn real_write(&mut self, buf: &[u8]) -> IoResLength {
-        const PACKET_SCHED_LEN: usize = 255;
-        self.buf_out.extend_from_slice(buf);
-        self.helper_write(PACKET_SCHED_LEN)
-            .await
-            .map_err(helpers::trf_err2io)?;
-        Ok(buf.len())
     }
 }
 
@@ -276,15 +271,22 @@ impl AsyncRead for Session {
 }
 
 impl AsyncWrite for Session {
-    #[inline]
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResLength> {
-        poll_future(cx, self.real_write(buf))
+        poll_future(cx, async move {
+            self.helper_write(false)
+                .await
+                .map_err(helpers::trf_err2io)?;
+            // we can't simply do this before the partial flush,
+            // because we can't 'roll back' in case of yielding or error
+            self.buf_out.extend_from_slice(buf);
+            Ok(buf.len())
+        })
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         poll_future(cx, async move {
             self.get_mut()
-                .helper_write(0)
+                .helper_write(true)
                 .await
                 .map_err(helpers::trf_err2io)
         })
