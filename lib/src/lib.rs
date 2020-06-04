@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use bytes::{BytesMut, Buf};
+use bytes::{Buf, BytesMut};
 use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use smol::Async;
@@ -210,7 +210,19 @@ impl Session {
                         buf_in.clear();
                         x
                     })?;
-                buf_in.truncate(len);
+                let padding_len: usize = buf_in.get_u16().into();
+                tracing::debug!("got len = {}, padding_len = {}", len, padding_len);
+                if padding_len <= len {
+                    buf_in.truncate(len - padding_len - 2);
+                } else {
+                    // do not panic if out-of-bounds
+                    buf_in.clear();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "padding length out of bounds",
+                    )
+                    .into());
+                }
             }
         }
         Ok(())
@@ -218,17 +230,39 @@ impl Session {
 
     async fn helper_write(&mut self, do_full_flush: bool) -> Result<(), Error> {
         // we know about the PacketStream interna and know we don't need to wait for readyness.
-        const PACKET_MAX_LEN: usize = 65535 - 16 - 1;
+        const PACKET_MAX_LEN: usize = 65535 - 20 - 1;
+        const PAD_TRG_SIZE: usize = 64;
         let threshold = if do_full_flush { 0 } else { PACKET_MAX_LEN - 1 };
         let mut sent_new_data = false;
-        tracing::debug!("buffered output len = {}; do full flush = {}", self.buf_out.len(), do_full_flush);
+        tracing::debug!(
+            "buffered output len = {}; do full flush = {}",
+            self.buf_out.len(),
+            do_full_flush
+        );
+        let mut thrng = rand::thread_rng();
         while self.buf_out.len() > threshold {
             // cont_pending calls flush if necessary
             self.cont_pending().await?;
             if let SessionState::Transport(ref mut tr) = &mut self.state {
+                use {bytes::BufMut, std::convert::TryInto};
                 let mut tmp = [0u8; 65535];
                 let inner_len = std::cmp::min(self.buf_out.len(), PACKET_MAX_LEN);
-                let len = tr.write_message(&self.buf_out[..inner_len], &mut tmp[..])?;
+                let wopad_len = inner_len + 2;
+                // padding prefix (20) = 16 (AEAD meta) + 2 (packet length) + 2 (non-padding length)
+                let mut padding_len = PAD_TRG_SIZE - ((20 + inner_len) % PAD_TRG_SIZE);
+                if (wopad_len + padding_len) > u16::MAX.into() {
+                    assert!(padding_len > 0);
+                    padding_len -= 1;
+                }
+                let mut inner_full = Zeroizing::new(Vec::with_capacity(wopad_len + padding_len));
+                // we save the padding_len instead of inner_len because the
+                // attacker might have lesser info about it
+                tracing::debug!("use padding_len = {}", padding_len);
+                inner_full.put_u16(padding_len.try_into().unwrap());
+                inner_full.extend_from_slice(&self.buf_out[..inner_len]);
+                inner_full.resize(wopad_len + padding_len, 0);
+                rand::RngCore::fill_bytes(&mut thrng, &mut inner_full[wopad_len..]);
+                let len = tr.write_message(&inner_full[..], &mut tmp[..])?;
                 // this only works because we know about the PacketStream interna
                 // because otherwise it violates the Sink interface
                 self.parent.start_send_unpin(&tmp[..len])?;
