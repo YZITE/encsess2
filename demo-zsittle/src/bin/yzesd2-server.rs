@@ -135,10 +135,14 @@ async fn handle_client(
     stream: smol::Async<std::net::TcpStream>,
     peer_addr: SocketAddr,
 ) {
-    eprintln!("Accepted client: {}", peer_addr);
     match yz_encsess::Session::new(stream, config).await {
         Err(x) => eprintln!("[ERROR] {}: session setup failed with: {}", peer_addr, x),
         Ok(x) => {
+            eprintln!(
+                "Accepted client: {} with public key = {}",
+                peer_addr,
+                base64::encode(x.get_remote_static().unwrap_or(&[]))
+            );
             smol::Task::spawn(async move {
                 let (reader, writer) = BiLock::new(x);
                 distr_send(&distr_in, peer_addr, DistrInner::Connect(writer));
