@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use bytes::BytesMut;
+use bytes::{BytesMut, Buf};
 use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt};
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use smol::Async;
@@ -227,10 +227,11 @@ impl Session {
             if let SessionState::Transport(ref mut tr) = &mut self.state {
                 let mut tmp = [0u8; 65535];
                 let inner_len = std::cmp::min(self.buf_out.len(), PACKET_MAX_LEN);
-                let len = tr.write_message(&self.buf_out.split_to(inner_len)[..], &mut tmp[..])?;
+                let len = tr.write_message(&self.buf_out[..inner_len], &mut tmp[..])?;
                 // this only works because we know about the PacketStream interna
                 // because otherwise it violates the Sink interface
                 self.parent.start_send_unpin(&tmp[..len])?;
+                self.buf_out.advance(inner_len);
                 sent_new_data = true;
             }
         }
@@ -252,7 +253,7 @@ impl AsyncBufRead for Session {
 
     #[inline]
     fn consume(self: Pin<&mut Self>, amt: usize) {
-        let _ = self.get_mut().buf_in.split_to(amt);
+        self.get_mut().buf_in.advance(amt)
     }
 }
 

@@ -99,7 +99,7 @@ impl<B: AsRef<[u8]>> Sink<B> for PacketStream {
             let len = pollerfwd!(stream.poll_write(cx, &buf_out[..]));
             tracing::debug!("sent {} bytes", len);
             // drop written part
-            let _ = buf_out.split_to(len);
+            buf_out.advance(len);
         }
         let stream = &mut this.stream;
         pin_mut!(stream);
