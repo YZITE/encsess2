@@ -5,7 +5,7 @@ use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use futures_util::{pin_mut, ready, sink::Sink, sink::SinkExt, stream::StreamExt};
 use smol::Async;
 use std::task::{Context, Poll};
-use std::{net::TcpStream, pin::Pin};
+use std::{future::Future, net::TcpStream, pin::Pin};
 use tracing::debug;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -73,8 +73,7 @@ macro_rules! pollerfwd {
 mod helpers;
 mod packet_stream;
 
-use helpers::poll_future;
-type IoResLength = std::io::Result<usize>;
+type IoPoll<T> = Poll<std::io::Result<T>>;
 
 pub struct Session {
     parent: packet_stream::PacketStream,
@@ -112,7 +111,7 @@ impl Session {
         };
 
         // perform handshake without code duplication
-        this.cont_pending().await?;
+        this.cont_pending_intern().await?;
 
         Ok(this)
     }
@@ -196,17 +195,17 @@ impl Session {
         }
     }
 
-    async fn cont_pending(&mut self) -> std::io::Result<()> {
-        self.cont_pending_intern()
-            .await
-            .map_err(helpers::trf_err2io)
+    fn poll_cont_pending(&mut self, cx: &mut Context<'_>) -> IoPoll<()> {
+        let fut = self.cont_pending_intern();
+        pin_mut!(fut);
+        fut.poll(cx).map(|x| x.map_err(helpers::trf_err2io))
     }
 
     fn poll_helper_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         do_full_flush: bool,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> IoPoll<()> {
         // we know about the PacketStream interna and know we don't need to wait for readyness.
         const PACKET_MAX_LEN: usize = MAX_U16LEN - 20 - 1;
         const PAD_TRG_SIZE: usize = 64;
@@ -221,7 +220,7 @@ impl Session {
         let mut thrng = rand::thread_rng();
         while this.buf_out.len() > threshold {
             // cont_pending calls flush if necessary
-            pollerfwd!(poll_future(cx, this.cont_pending()));
+            pollerfwd!(this.poll_cont_pending(cx));
 
             if let SessionState::Transport(ref mut tr) = &mut this.state {
                 use {bytes::BufMut, std::convert::TryInto};
@@ -262,10 +261,10 @@ impl Session {
 }
 
 impl AsyncBufRead for Session {
-    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<&[u8]> {
         let this = Pin::into_inner(self);
         if this.buf_in.is_empty() {
-            pollerfwd!(poll_future(cx, this.cont_pending()));
+            pollerfwd!(this.poll_cont_pending(cx));
 
             let buf_in = &mut this.buf_in;
             let parent = &mut this.parent;
@@ -303,11 +302,7 @@ impl AsyncBufRead for Session {
 }
 
 impl AsyncRead for Session {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<IoResLength> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> IoPoll<usize> {
         let mybuf = pollerfwd!(self.as_mut().poll_fill_buf(cx));
         let len = std::cmp::min(buf.len(), mybuf.len());
         buf[..len].copy_from_slice(&mybuf[..len]);
@@ -317,7 +312,7 @@ impl AsyncRead for Session {
 }
 
 impl AsyncWrite for Session {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResLength> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> IoPoll<usize> {
         pollerfwd!(self.as_mut().poll_helper_write(cx, false));
         // we can't simply do this before the partial flush,
         // because we can't 'roll back' in case of yielding or error
@@ -325,11 +320,11 @@ impl AsyncWrite for Session {
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<()> {
         self.poll_helper_write(cx, true)
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<()> {
         pollerfwd!(self.as_mut().poll_flush(cx));
         let parent = &mut self.parent;
         pin_mut!(parent);
