@@ -70,7 +70,23 @@ macro_rules! pollerfwd {
     }};
 }
 
-mod helpers;
+fn finish_builder_with_side(
+    builder: snow::Builder<'_>,
+    side: Side,
+) -> Result<snow::HandshakeState, snow::Error> {
+    match side {
+        Side::Initiator => builder.build_initiator(),
+        Side::Responder => builder.build_responder(),
+    }
+}
+
+fn trf_err2io(x: impl Into<crate::Error>) -> std::io::Error {
+    match x.into() {
+        crate::Error::Io(e) => e,
+        crate::Error::Noise(e) => std::io::Error::new(std::io::ErrorKind::PermissionDenied, e),
+    }
+}
+
 mod packet_stream;
 
 type IoPoll<T> = Poll<std::io::Result<T>>;
@@ -97,10 +113,7 @@ impl Session {
             builder = builder.remote_public_key(server_pubkey);
         }
 
-        let state = SessionState::Handshake(helpers::finish_builder_with_side(
-            builder,
-            config.side.side(),
-        )?);
+        let state = SessionState::Handshake(finish_builder_with_side(builder, config.side.side())?);
 
         let mut this = Session {
             parent: packet_stream::PacketStream::new(stream),
@@ -136,7 +149,7 @@ impl Session {
                         SessionState::Transport(tr)
                     } else {
                         SessionState::Handshake(
-                            helpers::finish_builder_with_side(
+                            finish_builder_with_side(
                                 snow::Builder::new(NOISE_PARAMS_REHS.clone())
                                     .local_private_key(&config.privkey[..])
                                     .remote_public_key(tr.get_remote_static().unwrap()),
@@ -198,7 +211,7 @@ impl Session {
     fn poll_cont_pending(&mut self, cx: &mut Context<'_>) -> IoPoll<()> {
         let fut = self.cont_pending_intern();
         pin_mut!(fut);
-        fut.poll(cx).map(|x| x.map_err(helpers::trf_err2io))
+        fut.poll(cx).map(|x| x.map_err(trf_err2io))
     }
 
     fn poll_helper_write(
@@ -243,7 +256,7 @@ impl Session {
                 let mut tmp = [0u8; MAX_U16LEN];
                 let len = tr
                     .write_message(&inner_full[..], &mut tmp[..])
-                    .map_err(helpers::trf_err2io)?;
+                    .map_err(trf_err2io)?;
                 // this only works because we know about the PacketStream interna
                 // because otherwise it violates the Sink interface
                 this.parent.start_send_unpin(&tmp[..len])?;
@@ -275,7 +288,7 @@ impl AsyncBufRead for Session {
                         .read_message(&(blob?)[..], &mut buf_in[..])
                         .map_err(|x| {
                             buf_in.clear();
-                            helpers::trf_err2io(x)
+                            trf_err2io(x)
                         })?;
                     let padding_len: usize = buf_in.get_u16().into();
                     debug!("got len = {}, padding_len = {}", len, padding_len);
