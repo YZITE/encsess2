@@ -2,10 +2,10 @@
 
 use bytes::{Buf, BytesMut};
 use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite};
-use futures_util::{pin_mut, ready, sink::SinkExt, stream::StreamExt};
+use futures_util::{pin_mut, ready, sink::Sink, sink::SinkExt, stream::StreamExt};
 use smol::Async;
 use std::task::{Context, Poll};
-use std::{future::Future, net::TcpStream, pin::Pin};
+use std::{net::TcpStream, pin::Pin};
 use tracing::debug;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -125,7 +125,7 @@ impl Session {
         }
     }
 
-    async fn cont_pending(&mut self) -> Result<(), Error> {
+    async fn cont_pending_intern(&mut self) -> Result<(), Error> {
         const MAX_NONCE_VALUE: u64 = 10;
 
         // perform all state transitions
@@ -196,24 +196,36 @@ impl Session {
         }
     }
 
-    async fn helper_write(&mut self, do_full_flush: bool) -> Result<(), std::io::Error> {
+    async fn cont_pending(&mut self) -> std::io::Result<()> {
+        self.cont_pending_intern()
+            .await
+            .map_err(helpers::trf_err2io)
+    }
+
+    fn poll_helper_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        do_full_flush: bool,
+    ) -> Poll<std::io::Result<()>> {
         // we know about the PacketStream interna and know we don't need to wait for readyness.
         const PACKET_MAX_LEN: usize = MAX_U16LEN - 20 - 1;
         const PAD_TRG_SIZE: usize = 64;
+        let this = Pin::into_inner(self);
         let threshold = if do_full_flush { 0 } else { PACKET_MAX_LEN - 1 };
         let mut sent_new_data = false;
         debug!(
             "buffered output len = {}; do full flush = {}",
-            self.buf_out.len(),
+            this.buf_out.len(),
             do_full_flush
         );
         let mut thrng = rand::thread_rng();
-        while self.buf_out.len() > threshold {
+        while this.buf_out.len() > threshold {
             // cont_pending calls flush if necessary
-            self.cont_pending().await.map_err(helpers::trf_err2io)?;
-            if let SessionState::Transport(ref mut tr) = &mut self.state {
+            pollerfwd!(poll_future(cx, this.cont_pending()));
+
+            if let SessionState::Transport(ref mut tr) = &mut this.state {
                 use {bytes::BufMut, std::convert::TryInto};
-                let inner_len = std::cmp::min(self.buf_out.len(), PACKET_MAX_LEN);
+                let inner_len = std::cmp::min(this.buf_out.len(), PACKET_MAX_LEN);
                 let wopad_len = inner_len + 2;
                 // padding prefix (20) = 16 (AEAD meta) + 2 (packet length) + 2 (non-padding length)
                 let mut padding_len = PAD_TRG_SIZE - ((20 + inner_len) % PAD_TRG_SIZE);
@@ -226,7 +238,7 @@ impl Session {
                 // attacker might have lesser info about it
                 debug!("use padding_len = {}", padding_len);
                 inner_full.put_u16(padding_len.try_into().unwrap());
-                inner_full.extend_from_slice(&self.buf_out[..inner_len]);
+                inner_full.extend_from_slice(&this.buf_out[..inner_len]);
                 inner_full.resize(wopad_len + padding_len, 0);
                 rand::RngCore::fill_bytes(&mut thrng, &mut inner_full[wopad_len..]);
                 let mut tmp = [0u8; MAX_U16LEN];
@@ -235,15 +247,17 @@ impl Session {
                     .map_err(helpers::trf_err2io)?;
                 // this only works because we know about the PacketStream interna
                 // because otherwise it violates the Sink interface
-                self.parent.start_send_unpin(&tmp[..len])?;
-                self.buf_out.advance(inner_len);
+                this.parent.start_send_unpin(&tmp[..len])?;
+                this.buf_out.advance(inner_len);
                 sent_new_data = true;
             }
         }
         if sent_new_data {
-            SinkExt::<&[u8]>::flush(&mut self.parent).await?;
+            let parent = &mut this.parent;
+            pin_mut!(parent);
+            pollerfwd!(Sink::<&[u8]>::poll_flush(parent, cx));
         }
-        Ok(())
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -251,14 +265,12 @@ impl AsyncBufRead for Session {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
         let this = Pin::into_inner(self);
         if this.buf_in.is_empty() {
-            pollerfwd!(poll_future(cx, this.cont_pending()).map(|x| x.map_err(helpers::trf_err2io)));
+            pollerfwd!(poll_future(cx, this.cont_pending()));
 
             let buf_in = &mut this.buf_in;
             let parent = &mut this.parent;
             if let SessionState::Transport(ref mut tr) = &mut this.state {
-                let fut_next = parent.next();
-                pin_mut!(fut_next);
-                if let Some(blob) = ready!(fut_next.poll(cx)) {
+                if let Some(blob) = ready!(parent.poll_next_unpin(cx)) {
                     buf_in.resize(MAX_U16LEN, 0);
                     let len = tr
                         .read_message(&(blob?)[..], &mut buf_in[..])
@@ -306,21 +318,21 @@ impl AsyncRead for Session {
 
 impl AsyncWrite for Session {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResLength> {
-        pollerfwd!(poll_future(cx, self.as_mut().helper_write(false)));
+        pollerfwd!(self.as_mut().poll_helper_write(cx, false));
         // we can't simply do this before the partial flush,
         // because we can't 'roll back' in case of yielding or error
         self.buf_out.extend_from_slice(buf);
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        poll_future(cx, self.helper_write(true))
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.poll_helper_write(cx, true)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         pollerfwd!(self.as_mut().poll_flush(cx));
         let parent = &mut self.parent;
         pin_mut!(parent);
-        futures_util::sink::Sink::<&[u8]>::poll_close(parent, cx)
+        Sink::<&[u8]>::poll_close(parent, cx)
     }
 }
