@@ -13,8 +13,9 @@ pub(crate) fn finish_builder_with_side(
     }
 }
 
-pub fn trf_err2io(x: crate::Error) -> std::io::Error {
-    match x {
+#[inline]
+pub fn trf_err2io(x: impl Into<crate::Error>) -> std::io::Error {
+    match x.into() {
         crate::Error::Io(e) => e,
         crate::Error::Noise(e) => std::io::Error::new(std::io::ErrorKind::PermissionDenied, e),
     }

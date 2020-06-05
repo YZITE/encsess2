@@ -2,11 +2,11 @@
 
 use bytes::{Buf, BytesMut};
 use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite};
-use futures_util::{sink::SinkExt, stream::StreamExt};
+use futures_util::{pin_mut, ready, sink::SinkExt, stream::StreamExt};
 use smol::Async;
-use std::net::TcpStream;
-use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::{future::Future, net::TcpStream, pin::Pin};
+use tracing::debug;
 use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Zeroize)]
@@ -63,7 +63,7 @@ pub enum Error {
 
 macro_rules! pollerfwd {
     ($x:expr) => {{
-        match futures_util::ready!($x) {
+        match ready!($x) {
             Ok(x) => x,
             Err(e) => return ::std::task::Poll::Ready(Err(e)),
         }
@@ -196,46 +196,13 @@ impl Session {
         }
     }
 
-    async fn helper_read(&mut self) -> Result<(), Error> {
-        if !self.buf_in.is_empty() {
-            return Ok(());
-        }
-        self.cont_pending().await?;
-        let buf_in = &mut self.buf_in;
-        if let SessionState::Transport(ref mut tr) = &mut self.state {
-            if let Some(blob) = self.parent.next().await {
-                buf_in.resize(MAX_U16LEN, 0);
-                let len = tr
-                    .read_message(&(blob?)[..], &mut buf_in[..])
-                    .map_err(|x| {
-                        buf_in.clear();
-                        x
-                    })?;
-                let padding_len: usize = buf_in.get_u16().into();
-                tracing::debug!("got len = {}, padding_len = {}", len, padding_len);
-                if padding_len <= len {
-                    buf_in.truncate(len - padding_len - 2);
-                } else {
-                    // do not panic if out-of-bounds
-                    buf_in.clear();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "padding length out of bounds",
-                    )
-                    .into());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn helper_write(&mut self, do_full_flush: bool) -> Result<(), Error> {
+    async fn helper_write(&mut self, do_full_flush: bool) -> Result<(), std::io::Error> {
         // we know about the PacketStream interna and know we don't need to wait for readyness.
         const PACKET_MAX_LEN: usize = MAX_U16LEN - 20 - 1;
         const PAD_TRG_SIZE: usize = 64;
         let threshold = if do_full_flush { 0 } else { PACKET_MAX_LEN - 1 };
         let mut sent_new_data = false;
-        tracing::debug!(
+        debug!(
             "buffered output len = {}; do full flush = {}",
             self.buf_out.len(),
             do_full_flush
@@ -243,7 +210,7 @@ impl Session {
         let mut thrng = rand::thread_rng();
         while self.buf_out.len() > threshold {
             // cont_pending calls flush if necessary
-            self.cont_pending().await?;
+            self.cont_pending().await.map_err(helpers::trf_err2io)?;
             if let SessionState::Transport(ref mut tr) = &mut self.state {
                 use {bytes::BufMut, std::convert::TryInto};
                 let inner_len = std::cmp::min(self.buf_out.len(), PACKET_MAX_LEN);
@@ -257,13 +224,15 @@ impl Session {
                 let mut inner_full = Zeroizing::new(Vec::with_capacity(wopad_len + padding_len));
                 // we save the padding_len instead of inner_len because the
                 // attacker might have lesser info about it
-                tracing::debug!("use padding_len = {}", padding_len);
+                debug!("use padding_len = {}", padding_len);
                 inner_full.put_u16(padding_len.try_into().unwrap());
                 inner_full.extend_from_slice(&self.buf_out[..inner_len]);
                 inner_full.resize(wopad_len + padding_len, 0);
                 rand::RngCore::fill_bytes(&mut thrng, &mut inner_full[wopad_len..]);
                 let mut tmp = [0u8; MAX_U16LEN];
-                let len = tr.write_message(&inner_full[..], &mut tmp[..])?;
+                let len = tr
+                    .write_message(&inner_full[..], &mut tmp[..])
+                    .map_err(helpers::trf_err2io)?;
                 // this only works because we know about the PacketStream interna
                 // because otherwise it violates the Sink interface
                 self.parent.start_send_unpin(&tmp[..len])?;
@@ -280,8 +249,38 @@ impl Session {
 
 impl AsyncBufRead for Session {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<&[u8]>> {
-        let this = self.get_mut();
-        pollerfwd!(poll_future(cx, this.helper_read()).map(|x| x.map_err(helpers::trf_err2io)));
+        let this = Pin::into_inner(self);
+        if this.buf_in.is_empty() {
+            pollerfwd!(poll_future(cx, this.cont_pending()).map(|x| x.map_err(helpers::trf_err2io)));
+
+            let buf_in = &mut this.buf_in;
+            let parent = &mut this.parent;
+            if let SessionState::Transport(ref mut tr) = &mut this.state {
+                let fut_next = parent.next();
+                pin_mut!(fut_next);
+                if let Some(blob) = ready!(fut_next.poll(cx)) {
+                    buf_in.resize(MAX_U16LEN, 0);
+                    let len = tr
+                        .read_message(&(blob?)[..], &mut buf_in[..])
+                        .map_err(|x| {
+                            buf_in.clear();
+                            helpers::trf_err2io(x)
+                        })?;
+                    let padding_len: usize = buf_in.get_u16().into();
+                    debug!("got len = {}, padding_len = {}", len, padding_len);
+                    if padding_len <= len {
+                        buf_in.truncate(len - padding_len - 2);
+                    } else {
+                        // do not panic if out-of-bounds
+                        buf_in.clear();
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "padding length out of bounds",
+                        )));
+                    }
+                }
+            }
+        }
         Poll::Ready(Ok(&this.buf_in[..]))
     }
 
@@ -307,8 +306,7 @@ impl AsyncRead for Session {
 
 impl AsyncWrite for Session {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<IoResLength> {
-        pollerfwd!(poll_future(cx, self.as_mut().helper_write(false))
-            .map(|x| x.map_err(helpers::trf_err2io)));
+        pollerfwd!(poll_future(cx, self.as_mut().helper_write(false)));
         // we can't simply do this before the partial flush,
         // because we can't 'roll back' in case of yielding or error
         self.buf_out.extend_from_slice(buf);
@@ -316,13 +314,13 @@ impl AsyncWrite for Session {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        poll_future(cx, self.helper_write(true)).map(|x| x.map_err(helpers::trf_err2io))
+        poll_future(cx, self.helper_write(true))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         pollerfwd!(self.as_mut().poll_flush(cx));
         let parent = &mut self.parent;
-        futures_util::pin_mut!(parent);
+        pin_mut!(parent);
         futures_util::sink::Sink::<&[u8]>::poll_close(parent, cx)
     }
 }
