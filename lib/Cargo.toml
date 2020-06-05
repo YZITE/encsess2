@@ -10,7 +10,6 @@ lazy_static = "1.4"
 rand = "0.7"
 smol = "0.1"
 take_mut = "0.2"
-thiserror = "1.0"
 tracing = "0.1"
 zeroize = "1.1"
 

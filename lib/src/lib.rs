@@ -9,6 +9,30 @@ use std::{future::Future, net::TcpStream, pin::Pin};
 use tracing::debug;
 use zeroize::{Zeroize, Zeroizing};
 
+lazy_static::lazy_static! {
+    static ref NOISE_PARAMS: snow::params::NoiseParams
+      = "Noise_XK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    static ref NOISE_PARAMS_REHS: snow::params::NoiseParams
+      = "Noise_KK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+}
+
+macro_rules! pollerfwd {
+    ($x:expr) => {{
+        match ready!($x) {
+            Ok(x) => x,
+            Err(e) => return ::std::task::Poll::Ready(Err(e)),
+        }
+    }};
+}
+
+mod packet_stream;
+use packet_stream::PacketStream;
+
+type IoPoll<T> = Poll<std::io::Result<T>>;
+
+const MAX_U16LEN: usize = 0xffff;
+const PACKET_MAX_LEN: usize = MAX_U16LEN - 20 - 1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Zeroize)]
 enum Side {
     /// Client = Initiator
@@ -32,67 +56,41 @@ impl SideConfig {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref NOISE_PARAMS: snow::params::NoiseParams
-      = "Noise_XK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-    static ref NOISE_PARAMS_REHS: snow::params::NoiseParams
-      = "Noise_KK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-}
-
-const MAX_U16LEN: usize = 0xffff;
-
 #[derive(Clone, Debug)]
 pub struct Config {
     pub privkey: Zeroizing<Vec<u8>>,
     pub side: SideConfig,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TrSubState {
+    Transport,
+    ScheduledHandshake,
+    Handshake,
+}
+
 enum SessionState {
+    Transport(snow::TransportState, TrSubState),
     Handshake(snow::HandshakeState),
-    Transport(snow::TransportState),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("noise protocol error: {0}")]
-    Noise(#[from] snow::Error),
-}
-
-macro_rules! pollerfwd {
-    ($x:expr) => {{
-        match ready!($x) {
-            Ok(x) => x,
-            Err(e) => return ::std::task::Poll::Ready(Err(e)),
-        }
-    }};
+fn trf_err2io(x: snow::Error) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, x)
 }
 
 fn finish_builder_with_side(
     builder: snow::Builder<'_>,
     side: Side,
-) -> Result<snow::HandshakeState, snow::Error> {
+) -> std::io::Result<snow::HandshakeState> {
     match side {
         Side::Initiator => builder.build_initiator(),
         Side::Responder => builder.build_responder(),
     }
+    .map_err(trf_err2io)
 }
-
-fn trf_err2io(x: impl Into<crate::Error>) -> std::io::Error {
-    match x.into() {
-        crate::Error::Io(e) => e,
-        crate::Error::Noise(e) => std::io::Error::new(std::io::ErrorKind::PermissionDenied, e),
-    }
-}
-
-mod packet_stream;
-
-type IoPoll<T> = Poll<std::io::Result<T>>;
 
 pub struct Session {
-    parent: packet_stream::PacketStream,
+    parent: PacketStream,
     config: Config,
     state: SessionState,
 
@@ -101,12 +99,43 @@ pub struct Session {
 }
 
 #[inline]
-pub fn generate_keypair() -> Result<snow::Keypair, Error> {
+pub fn generate_keypair() -> Result<snow::Keypair, snow::Error> {
     Ok(snow::Builder::new(NOISE_PARAMS.clone()).generate_keypair()?)
 }
 
+fn helper_send_packet(
+    pktstream: &mut PacketStream,
+    tr: &mut snow::TransportState,
+    pktbuf: &[u8],
+) -> std::io::Result<usize> {
+    const PAD_TRG_SIZE: usize = 64;
+    use {bytes::BufMut, std::convert::TryInto};
+    let inner_len = std::cmp::min(pktbuf.len(), PACKET_MAX_LEN);
+    let wopad_len = inner_len + 2;
+    // padding prefix (20) = 16 (AEAD meta) + 2 (packet length) + 2 (non-padding length)
+    let mut padding_len = PAD_TRG_SIZE - ((20 + inner_len) % PAD_TRG_SIZE);
+    if (wopad_len + padding_len) > MAX_U16LEN {
+        assert!(padding_len > 0);
+        padding_len -= 1;
+    }
+    let mut inner_full = Zeroizing::new(Vec::with_capacity(wopad_len + padding_len));
+    debug!("use padding_len = {}", padding_len);
+    inner_full.put_u16(inner_len.try_into().unwrap());
+    inner_full.extend_from_slice(&pktbuf[..inner_len]);
+    inner_full.resize(wopad_len + padding_len, 0);
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut inner_full[wopad_len..]);
+    let mut tmp = [0u8; MAX_U16LEN];
+    let len = tr
+        .write_message(&inner_full[..], &mut tmp[..])
+        .map_err(trf_err2io)?;
+    // this only works because we know about the PacketStream interna
+    // because otherwise it violates the Sink interface
+    pktstream.start_send_unpin(&tmp[..len])?;
+    Ok(inner_len)
+}
+
 impl Session {
-    pub async fn new(stream: Async<TcpStream>, config: Config) -> Result<Session, Error> {
+    pub async fn new(stream: Async<TcpStream>, config: Config) -> std::io::Result<Session> {
         let mut builder =
             snow::Builder::new(NOISE_PARAMS.clone()).local_private_key(&config.privkey[..]);
         if let SideConfig::Client { ref server_pubkey } = &config.side {
@@ -116,7 +145,7 @@ impl Session {
         let state = SessionState::Handshake(finish_builder_with_side(builder, config.side.side())?);
 
         let mut this = Session {
-            parent: packet_stream::PacketStream::new(stream),
+            parent: PacketStream::new(stream),
             config,
             state,
             buf_in: BytesMut::new(),
@@ -132,81 +161,148 @@ impl Session {
     #[inline]
     pub fn get_remote_static(&self) -> Option<&[u8]> {
         match &self.state {
-            SessionState::Transport(x) => x.get_remote_static(),
+            SessionState::Transport(x, _) => x.get_remote_static(),
             SessionState::Handshake(x) => x.get_remote_static(),
         }
     }
 
-    async fn cont_pending_intern(&mut self) -> Result<(), Error> {
+    async fn helper_fill_bufin(&mut self) -> std::io::Result<()> {
+        if let SessionState::Transport(ref mut tr, ref mut substate) = &mut self.state {
+            if let Some(blob) = self.parent.next().await {
+                let mut buf_in = self.buf_in.split_off(self.buf_in.len());
+                buf_in.resize(MAX_U16LEN, 0);
+                let len = tr
+                    .read_message(&(blob?)[..], &mut buf_in[..])
+                    .map_err(trf_err2io)?;
+                let inner_len: usize = buf_in.get_u16().into();
+                debug!("got len = {}, inner_len = {}", len, inner_len);
+                if inner_len > (len - 2) {
+                    // do not panic if out-of-bounds
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "inner length out of bounds",
+                    ));
+                }
+                buf_in.truncate(inner_len);
+                if inner_len == 0 {
+                    // got a token.
+                    use TrSubState as TSS;
+                    match substate {
+                        TSS::Transport => {
+                            // we didn't sent a token ourselves, do it now
+                            // we don't need to clear the output buffer
+                            helper_send_packet(&mut self.parent, tr, &[])?;
+                            SinkExt::<&[u8]>::flush(&mut self.parent).await?;
+                        }
+                        TSS::ScheduledHandshake => {
+                            // we already sent a token ourselves, do nothing
+                        }
+                        TSS::Handshake => {
+                            unreachable!("got a token while preparing for handshake, missing call to cont_pending?");
+                        }
+                    }
+                    *substate = TSS::Handshake;
+                    // NOTE: we need to check the substate in poll_fill_buf to be sure
+                    // to not return EOF when we are in the Handshake substate
+                }
+                self.buf_in.unsplit(buf_in);
+            }
+        }
+        Ok(())
+    }
+
+    async fn cont_pending_intern(&mut self) -> std::io::Result<()> {
         const MAX_NONCE_VALUE: u64 = 10;
 
         // perform all state transitions
         loop {
             let config = &self.config;
             let parent = &self.parent;
-            take_mut::take(&mut self.state, move |state| match state {
-                SessionState::Transport(tr) => {
-                    if std::cmp::max(tr.sending_nonce(), tr.receiving_nonce()) < MAX_NONCE_VALUE {
-                        SessionState::Transport(tr)
-                    } else {
-                        debug!("begin handshake with {:?}", parent);
-                        SessionState::Handshake(
-                            finish_builder_with_side(
-                                snow::Builder::new(NOISE_PARAMS_REHS.clone())
-                                    .local_private_key(&config.privkey[..])
-                                    .remote_public_key(tr.get_remote_static().unwrap()),
-                                config.side.side(),
-                            )
-                            .expect("unable to build HandshakeState"),
-                        )
-                    }
+            let mut need2send_token = false;
+            take_mut::take(&mut self.state, |state| match state {
+                SessionState::Transport(tr, TrSubState::Transport)
+                    if tr.sending_nonce() >= MAX_NONCE_VALUE =>
+                {
+                    need2send_token = true;
+                    SessionState::Transport(tr, TrSubState::ScheduledHandshake)
                 }
-                SessionState::Handshake(hs) => {
-                    if hs.is_handshake_finished() {
-                        debug!("finish handshake with {:?}", parent);
-                        SessionState::Transport(
-                            hs.into_transport_mode()
-                                .expect("unable to build TransportState"),
-                        )
-                    } else {
-                        SessionState::Handshake(hs)
-                    }
+                SessionState::Transport(tr, TrSubState::Transport)
+                    if tr.receiving_nonce() == (MAX_NONCE_VALUE + 1) =>
+                {
+                    tracing::warn!("expected handshake token from other peer, but didn't get one");
+                    SessionState::Transport(tr, TrSubState::Transport)
                 }
+
+                SessionState::Transport(tr, TrSubState::Handshake) => {
+                    debug!("begin handshake with {:?}", parent);
+                    SessionState::Handshake(
+                        finish_builder_with_side(
+                            snow::Builder::new(NOISE_PARAMS_REHS.clone())
+                                .local_private_key(&config.privkey[..])
+                                .remote_public_key(tr.get_remote_static().unwrap()),
+                            config.side.side(),
+                        )
+                        .expect("unable to build HandshakeState"),
+                    )
+                }
+
+                SessionState::Handshake(hs) if hs.is_handshake_finished() => {
+                    debug!("finish handshake with {:?}", parent);
+                    SessionState::Transport(
+                        hs.into_transport_mode()
+                            .expect("unable to build TransportState"),
+                        TrSubState::Transport,
+                    )
+                }
+                x => x,
             });
 
             // we can now deal with a state which doesn't need to change
             // this function is reentrant, because the state of our state machine is
             // put into self.state
 
-            if let SessionState::Handshake(ref mut noise) = &mut self.state {
-                // any `.await?` might yield and nuke `tmp`
-                let mut tmp = [0u8; MAX_U16LEN];
-                loop {
-                    // this might yield, but that's ok
-                    SinkExt::<&[u8]>::flush(&mut self.parent).await?;
-                    if noise.is_handshake_finished() {
-                        break;
-                    } else if noise.is_my_turn() {
-                        let len = noise
-                            .write_message(&[], &mut tmp[..])
-                            .expect("unable to create noise handshake message");
-                        // this might yield if err, but the item won't get lost
-                        self.parent.start_send_unpin(&tmp[..len])?;
-                    } else {
-                        // this line might yield and nuke `tmp`
-                        let _ = match self.parent.next().await {
-                            Some(x) => noise.read_message(&(x?)[..], &mut tmp[..])?,
-                            None => {
-                                return Err(Error::Io(std::io::Error::new(
-                                    std::io::ErrorKind::UnexpectedEof,
-                                    "eof while handshaking",
-                                )))
-                            }
-                        };
+            match &mut self.state {
+                SessionState::Handshake(ref mut noise) => {
+                    // any `.await?` might yield and nuke `tmp`
+                    let mut tmp = [0u8; MAX_U16LEN];
+                    loop {
+                        // this might yield, but that's ok
+                        SinkExt::<&[u8]>::flush(&mut self.parent).await?;
+                        if noise.is_handshake_finished() {
+                            break;
+                        } else if noise.is_my_turn() {
+                            let len = noise
+                                .write_message(&[], &mut tmp[..])
+                                .expect("unable to create noise handshake message");
+                            // this might yield if err, but the item won't get lost
+                            self.parent.start_send_unpin(&tmp[..len])?;
+                        } else {
+                            // this line might yield and nuke `tmp`
+                            let _ = match self.parent.next().await {
+                                Some(x) => noise
+                                    .read_message(&(x?)[..], &mut tmp[..])
+                                    .map_err(trf_err2io)?,
+                                None => {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "eof while handshaking",
+                                    ))
+                                }
+                            };
+                        }
                     }
                 }
-            } else {
-                return Ok(());
+                SessionState::Transport(ref mut tr, TrSubState::ScheduledHandshake) => {
+                    // we don't need to save $need2send_token in TrSubState,
+                    // because we have no yield point between setting and checking it
+                    if need2send_token {
+                        helper_send_packet(&mut self.parent, tr, &[])?;
+                        SinkExt::<&[u8]>::flush(&mut self.parent).await?;
+                    }
+                    // we need to wait until we get a token from the other peer
+                    self.helper_fill_bufin().await?;
+                }
+                _ => return Ok(()),
             }
         }
     }
@@ -214,7 +310,7 @@ impl Session {
     fn poll_cont_pending(&mut self, cx: &mut Context<'_>) -> IoPoll<()> {
         let fut = self.cont_pending_intern();
         pin_mut!(fut);
-        fut.poll(cx).map(|x| x.map_err(trf_err2io))
+        fut.poll(cx)
     }
 
     fn poll_helper_write(
@@ -223,8 +319,6 @@ impl Session {
         do_full_flush: bool,
     ) -> IoPoll<()> {
         // we know about the PacketStream interna and know we don't need to wait for readyness.
-        const PACKET_MAX_LEN: usize = MAX_U16LEN - 20 - 1;
-        const PAD_TRG_SIZE: usize = 64;
         let this = Pin::into_inner(self);
         let threshold = if do_full_flush { 0 } else { PACKET_MAX_LEN - 1 };
         let mut sent_new_data = false;
@@ -233,36 +327,16 @@ impl Session {
             this.buf_out.len(),
             do_full_flush
         );
-        let mut thrng = rand::thread_rng();
         while this.buf_out.len() > threshold {
             // cont_pending calls flush if necessary
             pollerfwd!(this.poll_cont_pending(cx));
 
-            if let SessionState::Transport(ref mut tr) = &mut this.state {
-                use {bytes::BufMut, std::convert::TryInto};
-                let inner_len = std::cmp::min(this.buf_out.len(), PACKET_MAX_LEN);
-                let wopad_len = inner_len + 2;
-                // padding prefix (20) = 16 (AEAD meta) + 2 (packet length) + 2 (non-padding length)
-                let mut padding_len = PAD_TRG_SIZE - ((20 + inner_len) % PAD_TRG_SIZE);
-                if (wopad_len + padding_len) > MAX_U16LEN {
-                    assert!(padding_len > 0);
-                    padding_len -= 1;
-                }
-                let mut inner_full = Zeroizing::new(Vec::with_capacity(wopad_len + padding_len));
-                debug!("use padding_len = {}", padding_len);
-                inner_full.put_u16(inner_len.try_into().unwrap());
-                inner_full.extend_from_slice(&this.buf_out[..inner_len]);
-                inner_full.resize(wopad_len + padding_len, 0);
-                rand::RngCore::fill_bytes(&mut thrng, &mut inner_full[wopad_len..]);
-                let mut tmp = [0u8; MAX_U16LEN];
-                let len = tr
-                    .write_message(&inner_full[..], &mut tmp[..])
-                    .map_err(trf_err2io)?;
-                // this only works because we know about the PacketStream interna
-                // because otherwise it violates the Sink interface
-                this.parent.start_send_unpin(&tmp[..len])?;
+            if let SessionState::Transport(ref mut tr, TrSubState::Transport) = &mut this.state {
+                let inner_len = helper_send_packet(&mut this.parent, tr, &this.buf_out[..])?;
                 this.buf_out.advance(inner_len);
                 sent_new_data = true;
+            } else {
+                unreachable!("bug in cont_pending helper: expected yield, got invalid state");
             }
         }
         if sent_new_data {
@@ -278,32 +352,17 @@ impl AsyncBufRead for Session {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<&[u8]> {
         let this = Pin::into_inner(self);
         if this.buf_in.is_empty() {
-            pollerfwd!(this.poll_cont_pending(cx));
-
-            let buf_in = &mut this.buf_in;
-            let parent = &mut this.parent;
-            if let SessionState::Transport(ref mut tr) = &mut this.state {
-                if let Some(blob) = ready!(parent.poll_next_unpin(cx)) {
-                    buf_in.resize(MAX_U16LEN, 0);
-                    let len = tr
-                        .read_message(&(blob?)[..], &mut buf_in[..])
-                        .map_err(|x| {
-                            buf_in.clear();
-                            trf_err2io(x)
-                        })?;
-                    let inner_len: usize = buf_in.get_u16().into();
-                    debug!("got len = {}, inner_len = {}", len, inner_len);
-                    if inner_len <= (len - 2) {
-                        buf_in.truncate(inner_len);
-                    } else {
-                        // do not panic if out-of-bounds
-                        buf_in.clear();
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "inner length out of bounds",
-                        )));
-                    }
+            loop {
+                pollerfwd!(this.poll_cont_pending(cx));
+                {
+                    let fut = this.helper_fill_bufin();
+                    pin_mut!(fut);
+                    pollerfwd!(fut.poll(cx));
                 }
+                if let SessionState::Transport(_, TrSubState::Transport) = &this.state {
+                    break;
+                }
+                // if we aren't in the Transport/Transport state, re-run cont_pending
             }
         }
         Poll::Ready(Ok(&this.buf_in[..]))
