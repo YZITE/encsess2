@@ -2,6 +2,7 @@
 members = [
   "lib",
   "demo-zsittle",
+  "packet-stream",
 ]
 
 [profile.release]

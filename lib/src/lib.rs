@@ -3,6 +3,7 @@
 use bytes::{Buf, BytesMut};
 use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use futures_util::{pin_mut, ready, sink::Sink, sink::SinkExt, stream::StreamExt};
+use packet_stream::PacketStream;
 use smol::Async;
 use std::task::{Context, Poll};
 use std::{future::Future, net::TcpStream, pin::Pin};
@@ -24,9 +25,6 @@ macro_rules! pollerfwd {
         }
     }};
 }
-
-mod packet_stream;
-use packet_stream::PacketStream;
 
 type IoPoll<T> = Poll<std::io::Result<T>>;
 
@@ -89,8 +87,10 @@ fn finish_builder_with_side(
     .map_err(trf_err2io)
 }
 
+type PacketTcpStream = PacketStream<Async<TcpStream>>;
+
 pub struct Session {
-    parent: PacketStream,
+    parent: PacketTcpStream,
     config: Config,
     state: SessionState,
 
@@ -105,7 +105,7 @@ pub fn generate_keypair() -> Result<snow::Keypair, snow::Error> {
 }
 
 fn helper_send_packet(
-    pktstream: &mut PacketStream,
+    pktstream: &mut PacketTcpStream,
     tr: &mut snow::TransportState,
     pktbuf: &[u8],
 ) -> std::io::Result<usize> {

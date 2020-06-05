@@ -1,22 +1,25 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures_util::io::{AsyncRead, AsyncWrite};
-use futures_util::{pin_mut, ready, sink::Sink, stream::Stream};
-use smol::Async;
-use std::net::TcpStream;
-use std::pin::Pin;
+use futures_core::{ready, stream::Stream};
+use futures_io::{AsyncRead, AsyncWrite};
+use futures_sink::Sink;
+use pin_utils::pin_mut;
 use std::task::{Context, Poll};
+use std::{fmt, pin::Pin};
 use tracing::{debug, instrument};
 
-#[derive(Debug)]
-pub struct PacketStream {
-    stream: Async<TcpStream>,
-    buf_in: BytesMut,
-    buf_out: BytesMut,
-    in_xpdlen: Option<usize>,
+pin_project_lite::pin_project! {
+    #[derive(Debug)]
+    pub struct PacketStream<T> {
+        #[pin]
+        stream: T,
+        buf_in: BytesMut,
+        buf_out: BytesMut,
+        in_xpdlen: Option<usize>,
+    }
 }
 
-impl PacketStream {
-    pub fn new(stream: Async<TcpStream>) -> Self {
+impl<T> PacketStream<T> {
+    pub fn new(stream: T) -> Self {
         Self {
             stream,
             buf_in: BytesMut::new(),
@@ -26,22 +29,34 @@ impl PacketStream {
     }
 }
 
-impl Stream for PacketStream {
+macro_rules! pollerfwd {
+    ($x:expr) => {{
+        match ready!($x) {
+            Ok(x) => x,
+            Err(e) => return ::std::task::Poll::Ready(Err(e)),
+        }
+    }};
+}
+
+impl<T> Stream for PacketStream<T>
+where
+    T: AsyncRead + fmt::Debug,
+{
     type Item = std::io::Result<Bytes>;
 
     #[instrument]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = Pin::into_inner(self);
+        let mut this = self.project();
 
         loop {
             if this.buf_in.len() >= 2 && this.in_xpdlen.is_none() {
-                this.in_xpdlen = Some(this.buf_in.get_u16().into());
+                *this.in_xpdlen = Some(this.buf_in.get_u16().into());
             }
-            if let Some(expect_len) = this.in_xpdlen {
+            if let Some(expect_len) = *this.in_xpdlen {
                 if this.buf_in.len() >= expect_len {
                     // we are done, if we reach this,
                     // the length spec was already removed from buf_xin
-                    this.in_xpdlen = None;
+                    *this.in_xpdlen = None;
                     return Poll::Ready(Some(Ok(this.buf_in.split_to(expect_len).freeze())));
                 }
             }
@@ -50,7 +65,7 @@ impl Stream for PacketStream {
             // the `read` might yield, and it should not leave any part of
             // `this` in an invalid state
             // assumption: `read` only yields if it has not read (and dropped) anything yet.
-            let mut rdbuf = [0u8; crate::MAX_U16LEN];
+            let mut rdbuf = [0u8; 8192];
             let stream = &mut this.stream;
             pin_mut!(stream);
             match ready!(stream.poll_read(cx, &mut rdbuf)) {
@@ -70,7 +85,11 @@ impl Stream for PacketStream {
 
 type SinkYield = Poll<Result<(), std::io::Error>>;
 
-impl<B: AsRef<[u8]>> Sink<B> for PacketStream {
+impl<B, T> Sink<B> for PacketStream<T>
+where
+    B: AsRef<[u8]>,
+    T: AsyncWrite + fmt::Debug,
+{
     type Error = std::io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
@@ -82,7 +101,7 @@ impl<B: AsRef<[u8]>> Sink<B> for PacketStream {
 
     fn start_send(self: Pin<&mut Self>, item: B) -> Result<(), std::io::Error> {
         use std::convert::TryInto;
-        let buf_out = &mut self.get_mut().buf_out;
+        let buf_out = self.project().buf_out;
         let item = item.as_ref();
         buf_out.put_u16(item.len().try_into().map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "length overflow")
@@ -93,10 +112,9 @@ impl<B: AsRef<[u8]>> Sink<B> for PacketStream {
 
     #[instrument]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
-        let this = Pin::into_inner(self);
-        let buf_out = &mut this.buf_out;
-        let stream = &mut this.stream;
-        pin_mut!(stream);
+        let this = self.project();
+        let buf_out = this.buf_out;
+        let mut stream = this.stream;
         // this part is easier... we just need to wait until all data is written
         while !buf_out.is_empty() {
             // every call to `write` might yield, and we must be sure to not send
@@ -112,8 +130,6 @@ impl<B: AsRef<[u8]>> Sink<B> for PacketStream {
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
         pollerfwd!(Sink::<B>::poll_flush(self.as_mut(), cx));
-        let stream = &mut self.stream;
-        pin_mut!(stream);
-        stream.poll_close(cx)
+        self.project().stream.poll_close(cx)
     }
 }
