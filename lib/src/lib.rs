@@ -246,10 +246,8 @@ impl Session {
                     padding_len -= 1;
                 }
                 let mut inner_full = Zeroizing::new(Vec::with_capacity(wopad_len + padding_len));
-                // we save the padding_len instead of inner_len because the
-                // attacker might have lesser info about it
                 debug!("use padding_len = {}", padding_len);
-                inner_full.put_u16(padding_len.try_into().unwrap());
+                inner_full.put_u16(inner_len.try_into().unwrap());
                 inner_full.extend_from_slice(&this.buf_out[..inner_len]);
                 inner_full.resize(wopad_len + padding_len, 0);
                 rand::RngCore::fill_bytes(&mut thrng, &mut inner_full[wopad_len..]);
@@ -290,16 +288,16 @@ impl AsyncBufRead for Session {
                             buf_in.clear();
                             trf_err2io(x)
                         })?;
-                    let padding_len: usize = buf_in.get_u16().into();
-                    debug!("got len = {}, padding_len = {}", len, padding_len);
-                    if padding_len <= len {
-                        buf_in.truncate(len - padding_len - 2);
+                    let inner_len: usize = buf_in.get_u16().into();
+                    debug!("got len = {}, inner_len = {}", len, inner_len);
+                    if inner_len <= (len - 2) {
+                        buf_in.truncate(inner_len);
                     } else {
                         // do not panic if out-of-bounds
                         buf_in.clear();
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            "padding length out of bounds",
+                            "inner length out of bounds",
                         )));
                     }
                 }
