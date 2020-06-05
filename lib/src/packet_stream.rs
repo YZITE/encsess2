@@ -5,8 +5,9 @@ use smol::Async;
 use std::net::TcpStream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tracing::debug;
+use tracing::{debug, instrument};
 
+#[derive(Debug)]
 pub struct PacketStream {
     stream: Async<TcpStream>,
     buf_in: BytesMut,
@@ -28,6 +29,7 @@ impl PacketStream {
 impl Stream for PacketStream {
     type Item = std::io::Result<Bytes>;
 
+    #[instrument]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = Pin::into_inner(self);
 
@@ -89,6 +91,7 @@ impl<B: AsRef<[u8]>> Sink<B> for PacketStream {
         Ok(())
     }
 
+    #[instrument]
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> SinkYield {
         let this = Pin::into_inner(self);
         let buf_out = &mut this.buf_out;

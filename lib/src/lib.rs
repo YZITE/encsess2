@@ -141,13 +141,15 @@ impl Session {
         const MAX_NONCE_VALUE: u64 = 10;
 
         // perform all state transitions
-        let config = &self.config;
         loop {
-            take_mut::take(&mut self.state, |state| match state {
+            let config = &self.config;
+            let parent = &self.parent;
+            take_mut::take(&mut self.state, move |state| match state {
                 SessionState::Transport(tr) => {
                     if std::cmp::max(tr.sending_nonce(), tr.receiving_nonce()) < MAX_NONCE_VALUE {
                         SessionState::Transport(tr)
                     } else {
+                        debug!("begin handshake with {:?}", parent);
                         SessionState::Handshake(
                             finish_builder_with_side(
                                 snow::Builder::new(NOISE_PARAMS_REHS.clone())
@@ -161,6 +163,7 @@ impl Session {
                 }
                 SessionState::Handshake(hs) => {
                     if hs.is_handshake_finished() {
+                        debug!("finish handshake with {:?}", parent);
                         SessionState::Transport(
                             hs.into_transport_mode()
                                 .expect("unable to build TransportState"),
