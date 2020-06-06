@@ -96,7 +96,6 @@ pub struct Session {
 
     buf_in: BytesMut,
     buf_out: BytesMut,
-    cached_out_err: Option<std::io::Error>,
 }
 
 #[inline]
@@ -151,7 +150,6 @@ impl Session {
             state,
             buf_in: BytesMut::new(),
             buf_out: BytesMut::new(),
-            cached_out_err: None,
         };
 
         // perform handshake without code duplication
@@ -388,25 +386,15 @@ impl AsyncRead for Session {
 
 impl AsyncWrite for Session {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> IoPoll<usize> {
-        Poll::Ready(if let Some(x) = self.cached_out_err.take() {
-            Err(x)
-        } else {
-            self.buf_out.extend_from_slice(buf);
-            if let Err(x) = ready!(self.as_mut().poll_helper_write(cx, false)) {
-                // cache the error bc rollback would be too difficult,
-                // but we still get a performance benefit in the success case
-                self.cached_out_err = Some(x);
-            }
-            Ok(buf.len())
-        })
+        pollerfwd!(self.as_mut().poll_helper_write(cx, false));
+        // we can't simply do this before the partial flush,
+        // because we can't 'roll back' in case of yielding or error
+        self.buf_out.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<()> {
-        if let Some(x) = self.cached_out_err.take() {
-            Poll::Ready(Err(x))
-        } else {
-            self.poll_helper_write(cx, true)
-        }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<()> {
+        self.poll_helper_write(cx, true)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<()> {
