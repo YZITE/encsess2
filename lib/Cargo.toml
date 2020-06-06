@@ -18,7 +18,7 @@ version = "0.3"
 default-features = false
 features = ["io", "std", "sink"]
 
-[dependencies.packet-stream]
+[dependencies.yz-packet-stream]
 version = "0.1"
 path = "../packet-stream"
 

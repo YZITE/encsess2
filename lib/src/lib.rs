@@ -3,7 +3,7 @@
 use bytes::{Buf, BytesMut};
 use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use futures_util::{pin_mut, ready, sink::Sink, sink::SinkExt, stream::StreamExt};
-use packet_stream::PacketStream;
+use yz_packet_stream::PacketStream;
 use smol::Async;
 use std::task::{Context, Poll};
 use std::{future::Future, net::TcpStream, pin::Pin};
