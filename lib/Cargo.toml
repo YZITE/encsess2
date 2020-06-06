@@ -22,3 +22,5 @@ features = ["io", "std", "sink"]
 [dependencies.snow]
 version = "0.7.0-alpha5"
 features = ["ring-accelerated"]
+git = "https://github.com/zserik/snow.git"
+branch = "simulate"

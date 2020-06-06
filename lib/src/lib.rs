@@ -103,12 +103,13 @@ pub fn generate_keypair() -> Result<snow::Keypair, snow::Error> {
     Ok(snow::Builder::new(NOISE_PARAMS.clone()).generate_keypair()?)
 }
 
+const PAD_TRG_SIZE: usize = 64;
+
 fn helper_send_packet(
     pktstream: &mut PacketTcpStream,
     tr: &mut snow::TransportState,
     pktbuf: &[u8],
 ) -> std::io::Result<usize> {
-    const PAD_TRG_SIZE: usize = 64;
     use {bytes::BufMut, std::convert::TryInto};
     let inner_len = std::cmp::min(pktbuf.len(), PACKET_MAX_LEN);
     let wopad_len = inner_len + 2;
@@ -271,9 +272,16 @@ impl Session {
                         if noise.is_handshake_finished() {
                             break;
                         } else if noise.is_my_turn() {
+                            // calculate padding
+                            let simdat = noise.simulate_write_message(&[]).unwrap();
+                            let padding_len = PAD_TRG_SIZE - (simdat.result_length % PAD_TRG_SIZE);
+                            let mut padding = Vec::new();
+                            padding.resize(padding_len, 0u8);
+                            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..]);
                             let len = noise
-                                .write_message(&[], &mut tmp[..])
+                                .write_message(&padding[..], &mut tmp[..])
                                 .expect("unable to create noise handshake message");
+                            assert_eq!(len % PAD_TRG_SIZE, 0);
                             // this might yield if err, but the item won't get lost
                             self.parent.start_send_unpin(&tmp[..len])?;
                         } else {
