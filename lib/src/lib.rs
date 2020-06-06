@@ -3,11 +3,11 @@
 use bytes::{Buf, BytesMut};
 use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use futures_util::{pin_mut, ready, sink::Sink, sink::SinkExt, stream::StreamExt};
-use yz_packet_stream::PacketStream;
 use smol::Async;
 use std::task::{Context, Poll};
 use std::{future::Future, net::TcpStream, pin::Pin};
 use tracing::debug;
+use yz_packet_stream::PacketStream;
 use zeroize::{Zeroize, Zeroizing};
 
 lazy_static::lazy_static! {
@@ -274,22 +274,28 @@ impl Session {
                         } else if noise.is_my_turn() {
                             // calculate padding
                             let simdat = noise.simulate_write_message(&[]).unwrap();
-                            let padding_len = PAD_TRG_SIZE - (simdat.result_length % PAD_TRG_SIZE);
+                            let padding_len =
+                                PAD_TRG_SIZE - ((2 + simdat.result_length) % PAD_TRG_SIZE);
                             let mut padding = Vec::new();
                             padding.resize(padding_len, 0u8);
                             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut padding[..]);
                             let len = noise
                                 .write_message(&padding[..], &mut tmp[..])
                                 .expect("unable to create noise handshake message");
-                            assert_eq!(len % PAD_TRG_SIZE, 0);
+                            debug!("Handshake: simulate_write_message = {}; padding_len = {}; write_message = {}", simdat.result_length, padding_len, len);
+                            assert_eq!((2 + len) % PAD_TRG_SIZE, 0);
                             // this might yield if err, but the item won't get lost
                             self.parent.start_send_unpin(&tmp[..len])?;
                         } else {
                             // this line might yield and nuke `tmp`
                             let _ = match self.parent.next().await {
-                                Some(x) => noise
-                                    .read_message(&(x?)[..], &mut tmp[..])
-                                    .map_err(trf_err2io)?,
+                                Some(x) => {
+                                    let x = x?;
+                                    debug!("Handshake: read_message = {}", x.len());
+                                    noise
+                                        .read_message(&x[..], &mut tmp[..])
+                                        .map_err(trf_err2io)?
+                                }
                                 None => {
                                     return Err(std::io::Error::new(
                                         std::io::ErrorKind::UnexpectedEof,
