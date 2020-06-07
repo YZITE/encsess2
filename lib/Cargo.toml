@@ -11,7 +11,6 @@ rand = "0.7"
 smol = "0.1"
 take_mut = "0.2"
 tracing = "0.1"
-yz-packet-stream = "0.1"
 zeroize = "1.1"
 
 [dependencies.futures-util]
@@ -22,3 +21,7 @@ features = ["io", "std", "sink"]
 [dependencies.snow]
 version = "0.7.0-alpha5"
 features = ["ring-accelerated"]
+
+[dependencies.yz-packet-stream]
+version = "0.1.1"
+features = ["tracing"]

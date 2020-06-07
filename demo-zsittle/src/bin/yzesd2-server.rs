@@ -2,8 +2,8 @@
 
 use futures_channel::mpsc;
 use futures_util::lock::BiLock;
-use std::net::SocketAddr;
-use std::pin::Pin;
+use serde::Deserialize;
+use std::{net::SocketAddr, pin::Pin, sync::Arc};
 use std::task::{Context, Poll};
 
 type DistrOutput = BiLock<yz_encsess::Session>;
@@ -96,6 +96,19 @@ async fn write_and_flush(v: &DistrOutput, msg: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct ConfigClient {
+    pubkey: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerConfig {
+    listen: String,
+    privkey: String,
+    pubkey: Option<String>, // unused, but practical
+    client: Vec<ConfigClient>,
+}
+
 async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
     use futures_util::{io::AsyncWriteExt, stream::StreamExt};
     use std::collections::HashMap;
@@ -131,18 +144,28 @@ async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
 
 async fn handle_client(
     distr_in: mpsc::UnboundedSender<DistrBlob>,
-    config: yz_encsess::Config,
+    svconfig: &ServerConfig,
+    yzconfig: Arc<yz_encsess::Config>,
     stream: smol::Async<std::net::TcpStream>,
     peer_addr: SocketAddr,
 ) {
-    match yz_encsess::Session::new(stream, config).await {
+    match yz_encsess::Session::new(stream, yzconfig).await {
         Err(x) => eprintln!("[ERROR] {}: session setup failed with: {}", peer_addr, x),
         Ok(x) => {
+            let clpubkey = base64::encode(x.get_remote_static().unwrap_or(&[]));
             eprintln!(
-                "Accepted client: {} with public key = {}",
+                "Accepted client {} with public key = {}",
                 peer_addr,
-                base64::encode(x.get_remote_static().unwrap_or(&[]))
+                clpubkey,
             );
+            if !svconfig.client.is_empty() {
+                if !svconfig.client.iter().any(|i| i.pubkey == clpubkey) {
+                    eprintln!(
+                        "Rejected client: {} with public key = {} because it isn't whitelisted", peer_addr, clpubkey,
+                    );
+                    return;
+                }
+            }
             smol::Task::spawn(async move {
                 let (reader, writer) = BiLock::new(x);
                 distr_send(&distr_in, peer_addr, DistrInner::Connect(writer));
@@ -173,33 +196,22 @@ async fn handle_client(
 
 #[smol_potat::main]
 async fn main() {
-    use clap::Arg;
     use futures_util::{future::FutureExt, stream::StreamExt};
     tracing_subscriber::fmt::init();
 
-    let matches = clap::App::new("yzesd-server")
-        .version(clap::crate_version!())
-        .author("Erik Zscheile <zseri.devel@ytrizja.de>")
-        .about("a yz-encsess encrypted session proto demonstration program")
-        .arg(
-            Arg::with_name("privkey")
-                .long("privkey")
-                .takes_value(true)
-                .help("uses the specified private key (otherwise generate a new one)"),
-        )
-        .arg(
-            Arg::with_name("listen")
-                .long("listen")
-                .takes_value(true)
-                .required(true)
-                .help("listen on the specified port (arg = SocketAddr)"),
-        )
-        .get_matches();
+    let args: Vec<_> = std::env::args().collect();
+    if args.len() != 2 {
+        eprintln!("USAGE: yzesd2-server CONFIG.toml");
+        std::process::exit(1);
+    }
 
-    let config = yz_encsess::Config {
-        privkey: yzesd_zsittle::get_private_key(matches.value_of("privkey")).into(),
+    let cfgf = std::fs::read(&args[1]).expect("unable to read config file");
+    let cfgf: ServerConfig = toml::from_slice(&cfgf[..]).expect("unable to parse config file");
+
+    let yzconfig = Arc::new(yz_encsess::Config {
+        privkey: yzesd_zsittle::get_private_key(Some(cfgf.privkey.as_str())).into(),
         side: yz_encsess::SideConfig::Server,
-    };
+    });
 
     let (s, ctrl_c) = futures_channel::mpsc::unbounded();
     ctrlc::set_handler(move || {
@@ -207,7 +219,7 @@ async fn main() {
     })
     .unwrap();
 
-    let listener = smol::Async::<std::net::TcpListener>::bind(matches.value_of("listen").unwrap())
+    let listener = smol::Async::<std::net::TcpListener>::bind(cfgf.listen.to_string())
         .expect("unable to listen on port");
 
     let (distr_in, distr_out) = mpsc::unbounded();
@@ -222,7 +234,7 @@ async fn main() {
             x = ctrl_c => break,
             y = fut_accept => {
                 let (stream, peer_addr) = y.expect("accept failed");
-                handle_client(distr_in.clone(), config.clone(), stream, peer_addr).await;
+                handle_client(distr_in.clone(), &cfgf, Arc::clone(&yzconfig), stream, peer_addr).await;
             }
         };
     }

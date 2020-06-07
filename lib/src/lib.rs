@@ -6,7 +6,7 @@ use futures_util::{pin_mut, ready, sink::Sink, sink::SinkExt, stream::StreamExt}
 use yz_packet_stream::PacketStream;
 use smol::Async;
 use std::task::{Context, Poll};
-use std::{future::Future, net::TcpStream, pin::Pin};
+use std::{future::Future, net::TcpStream, pin::Pin, sync::Arc};
 use tracing::debug;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -91,7 +91,7 @@ type PacketTcpStream = PacketStream<Async<TcpStream>>;
 
 pub struct Session {
     parent: PacketTcpStream,
-    config: Config,
+    config: Arc<Config>,
     state: SessionState,
 
     buf_in: BytesMut,
@@ -135,7 +135,7 @@ fn helper_send_packet(
 }
 
 impl Session {
-    pub async fn new(stream: Async<TcpStream>, config: Config) -> std::io::Result<Session> {
+    pub async fn new(stream: Async<TcpStream>, config: Arc<Config>) -> std::io::Result<Session> {
         let mut builder =
             snow::Builder::new(NOISE_PARAMS.clone()).local_private_key(&config.privkey[..]);
         if let SideConfig::Client { ref server_pubkey } = &config.side {

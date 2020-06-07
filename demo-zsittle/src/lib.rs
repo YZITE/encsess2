@@ -1,3 +1,5 @@
+#![forbid(deprecated, unsafe_code)]
+
 pub fn get_private_key(inp: Option<&str>) -> Vec<u8> {
     match inp {
         None => {
