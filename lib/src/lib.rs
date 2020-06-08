@@ -351,19 +351,17 @@ impl Session {
 impl AsyncBufRead for Session {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<&[u8]> {
         let this = Pin::into_inner(self);
-        if this.buf_in.is_empty() {
-            loop {
-                pollerfwd!(this.poll_cont_pending(cx));
-                {
-                    let fut = this.helper_fill_bufin();
-                    pin_mut!(fut);
-                    pollerfwd!(fut.poll(cx));
-                }
-                if let SessionState::Transport(_, TrSubState::Transport) = &this.state {
-                    break;
-                }
-                // if we aren't in the Transport/Transport state, re-run cont_pending
+        while this.buf_in.is_empty() {
+            pollerfwd!(this.poll_cont_pending(cx));
+            {
+                let fut = this.helper_fill_bufin();
+                pin_mut!(fut);
+                pollerfwd!(fut.poll(cx));
             }
+            if let SessionState::Transport(_, TrSubState::Transport) = &this.state {
+                break;
+            }
+            // if we aren't in the Transport/Transport state, re-run cont_pending
         }
         Poll::Ready(Ok(&this.buf_in[..]))
     }
