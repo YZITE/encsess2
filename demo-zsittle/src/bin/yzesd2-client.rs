@@ -1,7 +1,7 @@
 #![forbid(deprecated, unsafe_code)]
 
-use std::{collections::HashMap, sync::Arc};
 use serde::Deserialize;
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Deserialize)]
 struct ConfigServer {
@@ -39,10 +39,9 @@ fn main() {
     });
 
     smol::run(async move {
-        let stream =
-            smol::Async::<std::net::TcpStream>::connect(&use_server.connect)
-                .await
-                .expect("unable to connect TCP stream");
+        let stream = smol::Async::<std::net::TcpStream>::connect(&use_server.connect)
+            .await
+            .expect("unable to connect TCP stream");
 
         use futures_util::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let sess = yz_encsess::Session::new(stream, config)

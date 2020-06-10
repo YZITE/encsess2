@@ -3,11 +3,11 @@
 use bytes::{Buf, BytesMut};
 use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use futures_util::{pin_mut, ready, sink::Sink, sink::SinkExt, stream::StreamExt};
-use yz_packet_stream::PacketStream;
 use smol::Async;
 use std::task::{Context, Poll};
 use std::{future::Future, net::TcpStream, pin::Pin, sync::Arc};
 use tracing::debug;
+use yz_packet_stream::PacketStream;
 use zeroize::{Zeroize, Zeroizing};
 
 lazy_static::lazy_static! {

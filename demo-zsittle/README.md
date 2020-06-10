@@ -36,11 +36,12 @@ USAGE:
 
 ```toml
 # SVCONFIG.toml
-listen = "IP:PORT"
+listen  = "IP:PORT"
 privkey = "PRIVKEY"
 
 # if no 'Client' blocks exist at all, client whitelisting is disabled
 # e.g. anyone is then hopefully able to successfully connect to the server
 [[client]]
 pubkey = "PUBKEY"
+name   = "USERNAME"
 ```

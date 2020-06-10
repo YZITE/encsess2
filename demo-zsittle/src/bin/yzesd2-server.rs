@@ -3,13 +3,16 @@
 use futures_channel::mpsc;
 use futures_util::lock::BiLock;
 use serde::Deserialize;
-use std::{net::SocketAddr, pin::Pin, sync::Arc};
 use std::task::{Context, Poll};
+use std::{collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
 
-type DistrOutput = BiLock<yz_encsess::Session>;
+struct DistrPeerData {
+    sess: BiLock<yz_encsess::Session>,
+    name: String,
+}
 
 enum DistrInner {
-    Connect(DistrOutput),
+    Connect(DistrPeerData),
     Disconnect,
     Message(String),
 }
@@ -24,7 +27,7 @@ fn distr_send(distr_in: &mpsc::UnboundedSender<DistrBlob>, origin: SocketAddr, i
 }
 
 struct CustomReadUntil<'a> {
-    lock: &'a DistrOutput,
+    lock: &'a BiLock<yz_encsess::Session>,
     bytes: &'a mut Vec<u8>,
     until_byte: u8,
 }
@@ -76,7 +79,7 @@ impl<'a> std::future::Future for CustomReadUntil<'a> {
 
 #[inline]
 async fn locked_read_until(
-    lock: &DistrOutput,
+    lock: &BiLock<yz_encsess::Session>,
     bytes: &mut Vec<u8>,
     until_byte: u8,
 ) -> std::io::Result<()> {
@@ -88,7 +91,7 @@ async fn locked_read_until(
     .await
 }
 
-async fn write_and_flush(v: &DistrOutput, msg: &str) -> std::io::Result<()> {
+async fn write_and_flush(v: &BiLock<yz_encsess::Session>, msg: &str) -> std::io::Result<()> {
     use futures_util::io::AsyncWriteExt;
     let mut l = v.lock().await;
     l.write_all(msg.as_bytes()).await?;
@@ -99,6 +102,7 @@ async fn write_and_flush(v: &DistrOutput, msg: &str) -> std::io::Result<()> {
 #[derive(Debug, Deserialize)]
 struct ConfigClient {
     pubkey: String,
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,27 +115,33 @@ struct ServerConfig {
 
 async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
     use futures_util::{io::AsyncWriteExt, stream::StreamExt};
-    use std::collections::HashMap;
-    let mut outputs = HashMap::<SocketAddr, DistrOutput>::new();
+    let mut outputs = HashMap::<SocketAddr, DistrPeerData>::new();
     loop {
         while let Some(blob) = distr_out.next().await {
             let DistrBlob { origin, inner } = blob;
             match inner {
                 DistrInner::Disconnect => {
-                    if let Some(outp) = outputs.remove(&origin) {
-                        let _ = outp.lock().await.flush().await;
+                    if let Some(x) = outputs.remove(&origin) {
+                        let _ = x.sess.lock().await.flush().await;
                     }
                 }
                 DistrInner::Connect(wr) => {
                     outputs.insert(origin, wr);
                 }
                 DistrInner::Message(mut msg) => {
-                    msg = format!("{}: {}\n", origin.to_string(), msg);
+                    msg = format!(
+                        "{}: {}\n",
+                        outputs
+                            .get(&origin)
+                            .map(|x| x.name.to_string())
+                            .unwrap_or_else(|| origin.to_string()),
+                        msg
+                    );
                     print!("{}", msg);
                     let mut new_outputs = HashMap::new();
                     new_outputs.reserve(outputs.len());
                     for (k, v) in std::mem::take(&mut outputs) {
-                        if k == origin || write_and_flush(&v, &msg).await.is_ok() {
+                        if k == origin || write_and_flush(&v.sess, &msg).await.is_ok() {
                             new_outputs.insert(k, v);
                         }
                     }
@@ -153,22 +163,35 @@ async fn handle_client(
         Err(x) => eprintln!("[ERROR] {}: session setup failed with: {}", peer_addr, x),
         Ok(x) => {
             let clpubkey = base64::encode(x.get_remote_static().unwrap_or(&[]));
-            eprintln!(
-                "Accepted client {} with public key = {}",
-                peer_addr,
-                clpubkey,
-            );
-            if !svconfig.client.is_empty() {
-                if !svconfig.client.iter().any(|i| i.pubkey == clpubkey) {
-                    eprintln!(
-                        "Rejected client: {} with public key = {} because it isn't whitelisted", peer_addr, clpubkey,
-                    );
-                    return;
-                }
+            let mut peer_name = String::new();
+            if svconfig.client.is_empty() {
+                eprintln!(
+                    "Accepted client {} with public key = {}",
+                    peer_addr, clpubkey,
+                );
+            } else if let Some(x) = svconfig.client.iter().find(|i| i.pubkey == clpubkey) {
+                peer_name = x.name.clone();
+                eprintln!(
+                    "Accepted client {} with public key = {} and user name = {}",
+                    peer_addr, clpubkey, peer_name,
+                );
+            } else {
+                eprintln!(
+                    "Rejected client: {} with public key = {} because it isn't whitelisted",
+                    peer_addr, clpubkey,
+                );
+                return;
             }
             smol::Task::spawn(async move {
                 let (reader, writer) = BiLock::new(x);
-                distr_send(&distr_in, peer_addr, DistrInner::Connect(writer));
+                distr_send(
+                    &distr_in,
+                    peer_addr,
+                    DistrInner::Connect(DistrPeerData {
+                        sess: writer,
+                        name: peer_name,
+                    }),
+                );
                 let mut line = Vec::new();
                 while locked_read_until(&reader, &mut line, b'\n').await.is_ok() {
                     if line.is_empty() {
