@@ -1,13 +1,12 @@
 #![forbid(deprecated, unsafe_code)]
 
+use async_dup::Mutex;
 use futures_channel::mpsc;
-use futures_util::lock::BiLock;
 use serde::Deserialize;
-use std::task::{Context, Poll};
-use std::{collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr};
 
 struct DistrPeerData {
-    sess: BiLock<yz_encsess::Session>,
+    sess: async_dup::Arc<Mutex<yz_encsess::Session>>,
     name: String,
 }
 
@@ -26,91 +25,11 @@ fn distr_send(distr_in: &mpsc::UnboundedSender<DistrBlob>, origin: SocketAddr, i
     let _ = distr_in.unbounded_send(DistrBlob { origin, inner });
 }
 
-struct CustomReadUntil<'a> {
-    lock: &'a BiLock<yz_encsess::Session>,
-    bytes: &'a mut Vec<u8>,
-    until_byte: u8,
-}
-
-fn read_until_internal<R: futures_util::io::AsyncBufRead + ?Sized>(
-    mut reader: Pin<&mut R>,
-    cx: &mut Context<'_>,
-    byte: u8,
-    buf: &mut Vec<u8>,
-    read: &mut usize,
-) -> Poll<std::io::Result<usize>> {
-    loop {
-        let (done, used) = {
-            let available = futures_util::ready!(reader.as_mut().poll_fill_buf(cx))?;
-            if let Some(i) = memchr::memchr(byte, available) {
-                buf.extend_from_slice(&available[..=i]);
-                (true, i + 1)
-            } else {
-                buf.extend_from_slice(available);
-                (false, available.len())
-            }
-        };
-        reader.as_mut().consume(used);
-        *read += used;
-        if done || used == 0 {
-            return Poll::Ready(Ok(std::mem::replace(read, 0)));
-        }
-    }
-}
-
-impl<'a> std::future::Future for CustomReadUntil<'a> {
-    type Output = std::io::Result<()>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        use futures_util::ready;
-        let this = Pin::into_inner(self);
-        let mut l = ready!(this.lock.poll_lock(cx));
-        let mut rcnt = 0;
-        let ret = ready!(read_until_internal(
-            l.as_pin_mut(),
-            cx,
-            this.until_byte,
-            this.bytes,
-            &mut rcnt
-        ));
-        Poll::Ready(ret.map(|_| ()))
-    }
-}
-
-#[inline]
-async fn locked_read_until(
-    lock: &BiLock<yz_encsess::Session>,
-    bytes: &mut Vec<u8>,
-    until_byte: u8,
-) -> std::io::Result<()> {
-    CustomReadUntil {
-        lock,
-        bytes,
-        until_byte,
-    }
-    .await
-}
-
-async fn write_and_flush(v: &BiLock<yz_encsess::Session>, msg: &str) -> std::io::Result<()> {
+async fn write_and_flush(mut v: &Mutex<yz_encsess::Session>, msg: &str) -> std::io::Result<()> {
     use futures_util::io::AsyncWriteExt;
-    let mut l = v.lock().await;
-    l.write_all(msg.as_bytes()).await?;
-    l.flush().await?;
+    v.write_all(msg.as_bytes()).await?;
+    v.flush().await?;
     Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct ConfigClient {
-    pubkey: String,
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ServerConfig {
-    listen: String,
-    privkey: String,
-    pubkey: Option<String>, // unused, but practical
-    client: Vec<ConfigClient>,
 }
 
 async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
@@ -121,8 +40,8 @@ async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
             let DistrBlob { origin, inner } = blob;
             match inner {
                 DistrInner::Disconnect => {
-                    if let Some(x) = outputs.remove(&origin) {
-                        let _ = x.sess.lock().await.flush().await;
+                    if let Some(mut x) = outputs.remove(&origin) {
+                        let _ = x.sess.flush().await;
                     }
                 }
                 DistrInner::Connect(wr) => {
@@ -152,10 +71,24 @@ async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ConfigClient {
+    pubkey: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerConfig {
+    listen: String,
+    privkey: String,
+    pubkey: Option<String>, // unused, but practical
+    client: Vec<ConfigClient>,
+}
+
 async fn handle_client(
     distr_in: mpsc::UnboundedSender<DistrBlob>,
     svconfig: &ServerConfig,
-    yzconfig: Arc<yz_encsess::Config>,
+    yzconfig: std::sync::Arc<yz_encsess::Config>,
     stream: smol::Async<std::net::TcpStream>,
     peer_addr: SocketAddr,
 ) {
@@ -183,17 +116,18 @@ async fn handle_client(
                 return;
             }
             smol::Task::spawn(async move {
-                let (reader, writer) = BiLock::new(x);
+                use futures_util::AsyncBufReadExt;
+                let mut xm = async_dup::Arc::new(Mutex::new(x));
                 distr_send(
                     &distr_in,
                     peer_addr,
                     DistrInner::Connect(DistrPeerData {
-                        sess: writer,
+                        sess: xm.clone(),
                         name: peer_name,
                     }),
                 );
                 let mut line = Vec::new();
-                while locked_read_until(&reader, &mut line, b'\n').await.is_ok() {
+                while xm.read_line(&mut line).await.is_ok() {
                     if line.is_empty() {
                         break;
                     }
@@ -231,7 +165,7 @@ async fn main() {
     let cfgf = std::fs::read(&args[1]).expect("unable to read config file");
     let cfgf: ServerConfig = toml::from_slice(&cfgf[..]).expect("unable to parse config file");
 
-    let yzconfig = Arc::new(yz_encsess::Config {
+    let yzconfig = std::sync::Arc::new(yz_encsess::Config {
         privkey: yzesd_zsittle::get_private_key(Some(cfgf.privkey.as_str())).into(),
         side: yz_encsess::SideConfig::Server,
     });
@@ -257,7 +191,7 @@ async fn main() {
             x = ctrl_c => break,
             y = fut_accept => {
                 let (stream, peer_addr) = y.expect("accept failed");
-                handle_client(distr_in.clone(), &cfgf, Arc::clone(&yzconfig), stream, peer_addr).await;
+                handle_client(distr_in.clone(), &cfgf, std::sync::Arc::clone(&yzconfig), stream, peer_addr).await;
             }
         };
     }
