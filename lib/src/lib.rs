@@ -2,7 +2,7 @@
 
 use async_net::TcpStream;
 use bytes::{Buf, BytesMut};
-use futures_lite::{AsyncBufRead, AsyncRead, AsyncWrite, pin as pin_mut, ready};
+use futures_lite::{pin as pin_mut, ready, AsyncBufRead, AsyncRead, AsyncWrite};
 use futures_util::{sink::Sink, sink::SinkExt, stream::StreamExt};
 use std::task::{Context, Poll};
 use std::{future::Future, pin::Pin, sync::Arc};

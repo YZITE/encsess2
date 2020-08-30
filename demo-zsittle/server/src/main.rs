@@ -1,9 +1,13 @@
 #![forbid(deprecated, unsafe_code)]
 
+use async_executor::Executor;
+use easy_parallel::Parallel;
+use futures_lite::future;
 use futures_util::lock::BiLock;
 use serde::Deserialize;
 use std::task::{Context, Poll};
 use std::{collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
+use yzesd_zsittle::base64;
 
 struct DistrPeerData {
     sess: BiLock<yz_encsess::Session>,
@@ -152,6 +156,7 @@ async fn distribute(mut distr_out: async_channel::Receiver<DistrBlob>) {
 }
 
 async fn handle_client(
+    ex: &Executor,
     distr_in: async_channel::Sender<DistrBlob>,
     svconfig: &ServerConfig,
     yzconfig: Arc<yz_encsess::Config>,
@@ -181,7 +186,7 @@ async fn handle_client(
                 );
                 return;
             }
-            smol::Task::spawn(async move {
+            ex.spawn(async move {
                 let (reader, writer) = BiLock::new(x);
                 distr_send(
                     &distr_in,
@@ -239,31 +244,38 @@ fn main() {
     })
     .unwrap();
 
-    smol::run(async move {
-        use futures_util::{future::FutureExt, stream::StreamExt};
+    // spawn multithreaded executor
+    let ex = Executor::new();
+    let (signal, shutdown) = async_channel::unbounded::<()>();
 
-        let listener = async_net::TcpListener::bind(cfgf.listen.to_string())
-            .await
-            .expect("unable to listen on port");
+    Parallel::new()
+        .each(0..num_cpus::get(), |_| future::block_on(ex.run(shutdown.recv())))
+        .finish(|| { let ex = &ex; future::block_on(async move {
+            use futures_util::{future::FutureExt, stream::StreamExt};
 
-        let (distr_in, distr_out) = async_channel::unbounded();
-        let distributor = smol::Task::spawn(distribute(distr_out));
-        let ctrl_c = ctrl_c.into_future();
-        futures_util::pin_mut!(ctrl_c);
+            let listener = async_net::TcpListener::bind(cfgf.listen.to_string())
+                .await
+                .expect("unable to listen on port");
 
-        loop {
-            let fut_accept = listener.accept().fuse();
-            futures_util::pin_mut!(fut_accept);
-            futures_util::select! {
-                x = ctrl_c => break,
-                y = fut_accept => {
-                    let (stream, peer_addr) = y.expect("accept failed");
-                    handle_client(distr_in.clone(), &cfgf, Arc::clone(&yzconfig), stream, peer_addr).await;
-                }
-            };
-        }
+            let (distr_in, distr_out) = async_channel::unbounded();
+            let distributor = ex.spawn(distribute(distr_out));
+            let ctrl_c = ctrl_c.into_future();
+            futures_util::pin_mut!(ctrl_c);
 
-        std::mem::drop(distr_in);
-        distributor.cancel().await;
-    });
+            loop {
+                let fut_accept = listener.accept().fuse();
+                futures_util::pin_mut!(fut_accept);
+                futures_util::select! {
+                    x = ctrl_c => break,
+                    y = fut_accept => {
+                        let (stream, peer_addr) = y.expect("accept failed");
+                        handle_client(&ex, distr_in.clone(), &cfgf, Arc::clone(&yzconfig), stream, peer_addr).await;
+                    }
+                };
+            }
+
+            std::mem::drop(distr_in);
+            distributor.cancel().await;
+            drop(signal);
+        })});
 }
