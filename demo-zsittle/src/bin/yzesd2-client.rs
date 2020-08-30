@@ -38,7 +38,7 @@ fn main() {
         },
     });
 
-    smol::run(async move {
+    async_io::block_on(async move {
         let stream = async_net::TcpStream::connect(&use_server.connect)
             .await
             .expect("unable to connect TCP stream");
@@ -50,8 +50,8 @@ fn main() {
         let (srd, mut swr) = sess.split();
 
         // Create async stdin and stdout handles.
-        let mut stdin = futures_util::io::BufReader::new(smol::reader(std::io::stdin()));
-        let mut stdout = smol::writer(std::io::stdout());
+        let mut stdin = futures_util::io::BufReader::new(blocking::Unblock::new(std::io::stdin()));
+        let mut stdout = blocking::Unblock::new(std::io::stdout());
 
         futures_util::future::try_join(
             async move {

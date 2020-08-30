@@ -6,9 +6,10 @@ edition = "2018"
 publish = false
 
 [dependencies]
+async-io = "0.2"
 async-net = "1.0"
+blocking = "0.6"
 base64 = "0.12"
-smol = "0.1"
 toml = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.2.4"
