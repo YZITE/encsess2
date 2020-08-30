@@ -2,6 +2,7 @@
 members = [
   "lib",
   "demo-zsittle",
+  "demo-zsittle/server",
 ]
 
 [profile.release]
