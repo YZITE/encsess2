@@ -1,6 +1,5 @@
 #![forbid(deprecated, unsafe_code)]
 
-use futures_channel::mpsc;
 use futures_util::lock::BiLock;
 use serde::Deserialize;
 use std::task::{Context, Poll};
@@ -22,8 +21,8 @@ struct DistrBlob {
     inner: DistrInner,
 }
 
-fn distr_send(distr_in: &mpsc::UnboundedSender<DistrBlob>, origin: SocketAddr, inner: DistrInner) {
-    let _ = distr_in.unbounded_send(DistrBlob { origin, inner });
+fn distr_send(distr_in: &async_channel::Sender<DistrBlob>, origin: SocketAddr, inner: DistrInner) {
+    let _ = distr_in.try_send(DistrBlob { origin, inner });
 }
 
 struct CustomReadUntil<'a> {
@@ -113,7 +112,7 @@ struct ServerConfig {
     client: Vec<ConfigClient>,
 }
 
-async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
+async fn distribute(mut distr_out: async_channel::Receiver<DistrBlob>) {
     use futures_util::{io::AsyncWriteExt, stream::StreamExt};
     let mut outputs = HashMap::<SocketAddr, DistrPeerData>::new();
     loop {
@@ -153,7 +152,7 @@ async fn distribute(mut distr_out: mpsc::UnboundedReceiver<DistrBlob>) {
 }
 
 async fn handle_client(
-    distr_in: mpsc::UnboundedSender<DistrBlob>,
+    distr_in: async_channel::Sender<DistrBlob>,
     svconfig: &ServerConfig,
     yzconfig: Arc<yz_encsess::Config>,
     stream: async_net::TcpStream,
@@ -234,9 +233,9 @@ fn main() {
         side: yz_encsess::SideConfig::Server,
     });
 
-    let (s, ctrl_c) = futures_channel::mpsc::unbounded();
+    let (s, ctrl_c) = async_channel::bounded(2);
     ctrlc::set_handler(move || {
-        let _ = s.unbounded_send(());
+        let _ = s.try_send(());
     })
     .unwrap();
 
@@ -247,7 +246,7 @@ fn main() {
             .await
             .expect("unable to listen on port");
 
-        let (distr_in, distr_out) = mpsc::unbounded();
+        let (distr_in, distr_out) = async_channel::unbounded();
         let distributor = smol::Task::spawn(distribute(distr_out));
         let ctrl_c = ctrl_c.into_future();
         futures_util::pin_mut!(ctrl_c);
