@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
+use async_net::TcpStream;
 use bytes::{Buf, BytesMut};
 use futures_util::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use futures_util::{pin_mut, ready, sink::Sink, sink::SinkExt, stream::StreamExt};
-use smol::Async;
 use std::task::{Context, Poll};
-use std::{future::Future, net::TcpStream, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 use tracing::debug;
 use yz_packet_stream::PacketStream;
 use zeroize::{Zeroize, Zeroizing};
@@ -87,7 +87,7 @@ fn finish_builder_with_side(
     .map_err(trf_err2io)
 }
 
-type PacketTcpStream = PacketStream<Async<TcpStream>>;
+type PacketTcpStream = PacketStream<TcpStream>;
 
 pub struct Session {
     parent: PacketTcpStream,
@@ -135,7 +135,7 @@ fn helper_send_packet(
 }
 
 impl Session {
-    pub async fn new(stream: Async<TcpStream>, config: Arc<Config>) -> std::io::Result<Session> {
+    pub async fn new(stream: TcpStream, config: Arc<Config>) -> std::io::Result<Session> {
         let mut builder =
             snow::Builder::new(NOISE_PARAMS.clone()).local_private_key(&config.privkey[..]);
         if let SideConfig::Client { ref server_pubkey } = &config.side {

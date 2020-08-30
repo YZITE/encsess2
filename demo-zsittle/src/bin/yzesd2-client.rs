@@ -39,7 +39,7 @@ fn main() {
     });
 
     smol::run(async move {
-        let stream = smol::Async::<std::net::TcpStream>::connect(&use_server.connect)
+        let stream = async_net::TcpStream::connect(&use_server.connect)
             .await
             .expect("unable to connect TCP stream");
 

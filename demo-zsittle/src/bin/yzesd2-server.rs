@@ -156,7 +156,7 @@ async fn handle_client(
     distr_in: mpsc::UnboundedSender<DistrBlob>,
     svconfig: &ServerConfig,
     yzconfig: Arc<yz_encsess::Config>,
-    stream: smol::Async<std::net::TcpStream>,
+    stream: async_net::TcpStream,
     peer_addr: SocketAddr,
 ) {
     match yz_encsess::Session::new(stream, yzconfig).await {
@@ -217,9 +217,7 @@ async fn handle_client(
     }
 }
 
-#[smol_potat::main]
-async fn main() {
-    use futures_util::{future::FutureExt, stream::StreamExt};
+fn main() {
     tracing_subscriber::fmt::init();
 
     let args: Vec<_> = std::env::args().collect();
@@ -242,26 +240,31 @@ async fn main() {
     })
     .unwrap();
 
-    let listener = smol::Async::<std::net::TcpListener>::bind(cfgf.listen.to_string())
-        .expect("unable to listen on port");
+    smol::run(async move {
+        use futures_util::{future::FutureExt, stream::StreamExt};
 
-    let (distr_in, distr_out) = mpsc::unbounded();
-    let distributor = smol::Task::spawn(distribute(distr_out));
-    let ctrl_c = ctrl_c.into_future();
-    futures_util::pin_mut!(ctrl_c);
+        let listener = async_net::TcpListener::bind(cfgf.listen.to_string())
+            .await
+            .expect("unable to listen on port");
 
-    loop {
-        let fut_accept = listener.accept().fuse();
-        futures_util::pin_mut!(fut_accept);
-        futures_util::select! {
-            x = ctrl_c => break,
-            y = fut_accept => {
-                let (stream, peer_addr) = y.expect("accept failed");
-                handle_client(distr_in.clone(), &cfgf, Arc::clone(&yzconfig), stream, peer_addr).await;
-            }
-        };
-    }
+        let (distr_in, distr_out) = mpsc::unbounded();
+        let distributor = smol::Task::spawn(distribute(distr_out));
+        let ctrl_c = ctrl_c.into_future();
+        futures_util::pin_mut!(ctrl_c);
 
-    std::mem::drop(distr_in);
-    distributor.cancel().await;
+        loop {
+            let fut_accept = listener.accept().fuse();
+            futures_util::pin_mut!(fut_accept);
+            futures_util::select! {
+                x = ctrl_c => break,
+                y = fut_accept => {
+                    let (stream, peer_addr) = y.expect("accept failed");
+                    handle_client(distr_in.clone(), &cfgf, Arc::clone(&yzconfig), stream, peer_addr).await;
+                }
+            };
+        }
+
+        std::mem::drop(distr_in);
+        distributor.cancel().await;
+    });
 }

@@ -5,10 +5,10 @@ authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
 edition = "2018"
 
 [dependencies]
+async-net = "1.0"
 bytes = "0.5"
 lazy_static = "1.4"
 rand = "0.7"
-smol = "0.1"
 take_mut = "0.2"
 tracing = "0.1"
 zeroize = "1.1"
@@ -19,7 +19,7 @@ default-features = false
 features = ["io", "std", "sink"]
 
 [dependencies.snow]
-version = "0.7.0-alpha5"
+version = "0.7"
 features = ["ring-accelerated"]
 
 [dependencies.yz-packet-stream]
