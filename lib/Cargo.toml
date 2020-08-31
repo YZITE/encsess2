@@ -14,15 +14,10 @@ take_mut = "0.2"
 tracing = "0.1"
 zeroize = "1.1"
 
-[dependencies.futures-util]
-version = "0.3"
-default-features = false
-features = ["io", "std", "sink"]
-
 [dependencies.snow]
 version = "0.7"
 features = ["ring-accelerated"]
 
 [dependencies.yz-packet-stream]
-version = "0.1.1"
+version = "0.2.0"
 features = ["tracing"]

@@ -2,8 +2,7 @@
 
 use async_net::TcpStream;
 use bytes::{Buf, BytesMut};
-use futures_lite::{pin as pin_mut, ready, AsyncBufRead, AsyncRead, AsyncWrite};
-use futures_util::{sink::Sink, sink::SinkExt, stream::StreamExt};
+use futures_lite::{pin as pin_mut, ready, AsyncBufRead, AsyncRead, AsyncWrite, StreamExt};
 use std::task::{Context, Poll};
 use std::{future::Future, pin::Pin, sync::Arc};
 use tracing::debug;
@@ -24,6 +23,33 @@ macro_rules! pollerfwd {
             Err(e) => return ::std::task::Poll::Ready(Err(e)),
         }
     }};
+}
+
+// poll_fn, stolen from `futures-util`
+#[inline]
+fn poll_fn<T, F>(f: F) -> impl Future<Output = T> + Unpin
+where
+    F: FnMut(&mut Context<'_>) -> Poll<T>
+{
+    #[must_use = "futures do nothing unless you `.await` or poll them"]
+    struct PollFn<F> {
+        f: F,
+    }
+
+    impl<F> Unpin for PollFn<F> {}
+
+    impl<T, F> Future for PollFn<F>
+        where F: FnMut(&mut Context<'_>) -> Poll<T>,
+    {
+        type Output = T;
+
+        #[inline]
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+            (&mut self.f)(cx)
+        }
+    }
+
+    PollFn { f }
 }
 
 type IoPoll<T> = Poll<std::io::Result<T>>;
@@ -72,6 +98,7 @@ enum SessionState {
     Handshake(snow::HandshakeState),
 }
 
+#[inline(always)]
 fn trf_err2io(x: snow::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, x)
 }
@@ -128,10 +155,13 @@ fn helper_send_packet(
     let len = tr
         .write_message(&inner_full[..], &mut tmp[..])
         .map_err(trf_err2io)?;
-    // this only works because we know about the PacketStream interna
-    // because otherwise it violates the Sink interface
-    pktstream.start_send_unpin(&tmp[..len])?;
+    Pin::new(pktstream).enqueue(&tmp[..len])?;
     Ok(inner_len)
+}
+
+#[inline]
+async fn flush_pts(pts: &mut PacketTcpStream) -> std::io::Result<()> {
+    poll_fn(move |cx| PacketStream::poll_flush(Pin::new(pts), cx)).await
 }
 
 impl Session {
@@ -192,7 +222,7 @@ impl Session {
                             // we didn't sent a token ourselves, do it now
                             // we don't need to clear the output buffer
                             helper_send_packet(&mut self.parent, tr, &[])?;
-                            SinkExt::<&[u8]>::flush(&mut self.parent).await?;
+                            flush_pts(&mut self.parent).await?;
                         }
                         TSS::ScheduledHandshake => {
                             // we already sent a token ourselves, do nothing
@@ -267,7 +297,7 @@ impl Session {
                     let mut tmp = [0u8; MAX_U16LEN];
                     loop {
                         // this might yield, but that's ok
-                        SinkExt::<&[u8]>::flush(&mut self.parent).await?;
+                        flush_pts(&mut self.parent).await?;
                         if noise.is_handshake_finished() {
                             break;
                         } else if noise.is_my_turn() {
@@ -275,7 +305,7 @@ impl Session {
                                 .write_message(&[], &mut tmp[..])
                                 .expect("unable to create noise handshake message");
                             // this might yield if err, but the item won't get lost
-                            self.parent.start_send_unpin(&tmp[..len])?;
+                            Pin::new(&mut self.parent).enqueue(&tmp[..len])?;
                         } else {
                             // this line might yield and nuke `tmp`
                             let _ = match self.parent.next().await {
@@ -297,7 +327,7 @@ impl Session {
                     // because we have no yield point between setting and checking it
                     if need2send_token {
                         helper_send_packet(&mut self.parent, tr, &[])?;
-                        SinkExt::<&[u8]>::flush(&mut self.parent).await?;
+                        flush_pts(&mut self.parent).await?;
                     }
                     // we need to wait until we get a token from the other peer
                     self.helper_fill_bufin().await?;
@@ -340,9 +370,7 @@ impl Session {
             }
         }
         if sent_new_data {
-            let parent = &mut this.parent;
-            pin_mut!(parent);
-            pollerfwd!(Sink::<&[u8]>::poll_flush(parent, cx));
+            pollerfwd!(Pin::new(&mut this.parent).poll_flush(cx));
         }
         Poll::Ready(Ok(()))
     }
@@ -397,8 +425,6 @@ impl AsyncWrite for Session {
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<()> {
         pollerfwd!(self.as_mut().poll_flush(cx));
-        let parent = &mut self.parent;
-        pin_mut!(parent);
-        Sink::<&[u8]>::poll_close(parent, cx)
+        Pin::new(&mut self.parent).poll_close(cx)
     }
 }
