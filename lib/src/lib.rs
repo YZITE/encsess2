@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use async_net::TcpStream;
-use bytes::{Buf, BytesMut};
 use futures_lite::{pin as pin_mut, ready, AsyncBufRead, AsyncRead, AsyncWrite, StreamExt};
 use std::task::{Context, Poll};
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -121,8 +120,8 @@ pub struct Session {
     config: Arc<Config>,
     state: SessionState,
 
-    buf_in: BytesMut,
-    buf_out: BytesMut,
+    buf_in: Vec<u8>,
+    buf_out: Vec<u8>,
 }
 
 #[inline]
@@ -136,7 +135,7 @@ fn helper_send_packet(
     pktbuf: &[u8],
 ) -> std::io::Result<usize> {
     const PAD_TRG_SIZE: usize = 64;
-    use {bytes::BufMut, std::convert::TryInto};
+    use std::convert::TryInto;
     let inner_len = std::cmp::min(pktbuf.len(), PACKET_MAX_LEN);
     let wopad_len = inner_len + 2;
     // padding prefix (20) = 16 (AEAD meta) + 2 (packet length) + 2 (non-padding length)
@@ -147,7 +146,7 @@ fn helper_send_packet(
     }
     let mut inner_full = Zeroizing::new(Vec::with_capacity(wopad_len + padding_len));
     debug!("use padding_len = {}", padding_len);
-    inner_full.put_u16(inner_len.try_into().unwrap());
+    inner_full.extend_from_slice(&u16::to_be_bytes(inner_len.try_into().unwrap())[..]);
     inner_full.extend_from_slice(&pktbuf[..inner_len]);
     inner_full.resize(wopad_len + padding_len, 0);
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut inner_full[wopad_len..]);
@@ -178,8 +177,8 @@ impl Session {
             parent: PacketStream::new(stream),
             config,
             state,
-            buf_in: BytesMut::new(),
-            buf_out: BytesMut::new(),
+            buf_in: Vec::new(),
+            buf_out: Vec::new(),
         };
 
         // perform handshake without code duplication
@@ -199,12 +198,14 @@ impl Session {
     async fn helper_fill_bufin(&mut self) -> std::io::Result<()> {
         if let SessionState::Transport(ref mut tr, ref mut substate) = &mut self.state {
             if let Some(blob) = self.parent.next().await {
-                let mut buf_in = self.buf_in.split_off(self.buf_in.len());
+                let mut buf_in = Vec::with_capacity(MAX_U16LEN);
                 buf_in.resize(MAX_U16LEN, 0);
                 let len = tr
                     .read_message(&(blob?)[..], &mut buf_in[..])
                     .map_err(trf_err2io)?;
-                let inner_len: usize = buf_in.get_u16().into();
+                let mut inner_len = [0u8; 2usize];
+                inner_len.copy_from_slice(&buf_in[..2]);
+                let inner_len: usize = u16::from_be_bytes(inner_len).into();
                 debug!("got len = {}, inner_len = {}", len, inner_len);
                 if inner_len > (len - 2) {
                     // do not panic if out-of-bounds
@@ -213,7 +214,6 @@ impl Session {
                         "inner length out of bounds",
                     ));
                 }
-                buf_in.truncate(inner_len);
                 if inner_len == 0 {
                     // got a token.
                     use TrSubState as TSS;
@@ -234,8 +234,9 @@ impl Session {
                     *substate = TSS::Handshake;
                     // NOTE: we need to check the substate in poll_fill_buf to be sure
                     // to not return EOF when we are in the Handshake substate
+                } else {
+                    self.buf_in.extend_from_slice(&(&buf_in[2..])[..inner_len]);
                 }
-                self.buf_in.unsplit(buf_in);
             }
         }
         Ok(())
@@ -363,7 +364,7 @@ impl Session {
 
             if let SessionState::Transport(ref mut tr, TrSubState::Transport) = &mut this.state {
                 let inner_len = helper_send_packet(&mut this.parent, tr, &this.buf_out[..])?;
-                this.buf_out.advance(inner_len);
+                let _ = this.buf_out.drain(..inner_len);
                 sent_new_data = true;
             } else {
                 unreachable!("bug in cont_pending helper: expected yield, got invalid state");
@@ -396,7 +397,7 @@ impl AsyncBufRead for Session {
 
     #[inline]
     fn consume(mut self: Pin<&mut Self>, amt: usize) {
-        self.buf_in.advance(amt)
+        let _ = self.buf_in.drain(..amt);
     }
 }
 

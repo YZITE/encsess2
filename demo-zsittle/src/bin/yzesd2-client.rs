@@ -43,6 +43,8 @@ fn main() {
             .await
             .expect("unable to connect TCP stream");
 
+        stream.set_nodelay(true).expect("unable to activate nodelay");
+
         use futures_util::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let sess = yz_encsess::Session::new(stream, config)
             .await
@@ -50,7 +52,7 @@ fn main() {
         let (srd, mut swr) = sess.split();
 
         // Create async stdin and stdout handles.
-        let mut stdin = futures_util::io::BufReader::new(blocking::Unblock::new(std::io::stdin()));
+        let mut stdin = futures_lite::io::BufReader::new(blocking::Unblock::new(std::io::stdin()));
         let mut stdout = blocking::Unblock::new(std::io::stdout());
 
         futures_util::future::try_join(
