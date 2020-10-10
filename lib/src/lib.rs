@@ -2,6 +2,7 @@
 
 use async_net::TcpStream;
 use futures_lite::{pin as pin_mut, ready, AsyncBufRead, AsyncRead, AsyncWrite, StreamExt};
+use futures_micro::poll_fn;
 use std::task::{Context, Poll};
 use std::{future::Future, pin::Pin, sync::Arc};
 use tracing::debug;
@@ -22,33 +23,6 @@ macro_rules! pollerfwd {
             Err(e) => return ::std::task::Poll::Ready(Err(e)),
         }
     }};
-}
-
-// poll_fn, stolen from `futures-util`
-#[inline]
-fn poll_fn<T, F>(f: F) -> impl Future<Output = T> + Unpin
-where
-    F: FnMut(&mut Context<'_>) -> Poll<T>
-{
-    #[must_use = "futures do nothing unless you `.await` or poll them"]
-    struct PollFn<F> {
-        f: F,
-    }
-
-    impl<F> Unpin for PollFn<F> {}
-
-    impl<T, F> Future for PollFn<F>
-        where F: FnMut(&mut Context<'_>) -> Poll<T>,
-    {
-        type Output = T;
-
-        #[inline]
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-            (&mut self.f)(cx)
-        }
-    }
-
-    PollFn { f }
 }
 
 type IoPoll<T> = Poll<std::io::Result<T>>;
@@ -231,9 +205,9 @@ impl Session {
                             unreachable!("got a token while preparing for handshake, missing call to cont_pending?");
                         }
                     }
-                    *substate = TSS::Handshake;
                     // NOTE: we need to check the substate in poll_fill_buf to be sure
                     // to not return EOF when we are in the Handshake substate
+                    *substate = TSS::Handshake;
                 } else {
                     self.buf_in.extend_from_slice(&(&buf_in[2..])[..inner_len]);
                 }

@@ -7,6 +7,7 @@ edition = "2018"
 [dependencies]
 async-net = "1.0"
 futures-lite = "1.0"
+futures-micro = "0.3"
 lazy_static = "1.4"
 rand = "0.7"
 take_mut = "0.2"

@@ -43,7 +43,9 @@ fn main() {
             .await
             .expect("unable to connect TCP stream");
 
-        stream.set_nodelay(true).expect("unable to activate nodelay");
+        stream
+            .set_nodelay(true)
+            .expect("unable to activate nodelay");
 
         use futures_util::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let sess = yz_encsess::Session::new(stream, config)
