@@ -16,15 +16,6 @@ lazy_static::lazy_static! {
       = "Noise_KK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
 }
 
-macro_rules! pollerfwd {
-    ($x:expr) => {{
-        match ready!($x) {
-            Ok(x) => x,
-            Err(e) => return ::std::task::Poll::Ready(Err(e)),
-        }
-    }};
-}
-
 type IoPoll<T> = Poll<std::io::Result<T>>;
 
 const MAX_U16LEN: usize = 0xffff;
@@ -347,7 +338,7 @@ impl Session {
         );
         while this.buf_out.len() > threshold {
             // cont_pending calls flush if necessary
-            pollerfwd!(this.poll_cont_pending(cx));
+            ready!(this.poll_cont_pending(cx)?);
 
             if let SessionState::Transport(ref mut tr, TrSubState::Transport) = &mut this.state {
                 let inner_len = helper_send_packet(&mut this.parent, tr, &this.buf_out[..])?;
@@ -358,7 +349,7 @@ impl Session {
             }
         }
         if sent_new_data {
-            pollerfwd!(Pin::new(&mut this.parent).poll_flush(cx));
+            ready!(Pin::new(&mut this.parent).poll_flush(cx)?);
         }
         Poll::Ready(Ok(()))
     }
@@ -368,11 +359,11 @@ impl AsyncBufRead for Session {
     fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<&[u8]> {
         let this = Pin::into_inner(self);
         while this.buf_in.is_empty() {
-            pollerfwd!(this.poll_cont_pending(cx));
+            ready!(this.poll_cont_pending(cx)?);
             {
                 let fut = this.helper_fill_bufin();
                 pin_mut!(fut);
-                pollerfwd!(fut.poll(cx));
+                ready!(fut.poll(cx)?);
             }
             if let SessionState::Transport(_, TrSubState::Transport) = &this.state {
                 break;
@@ -390,7 +381,7 @@ impl AsyncBufRead for Session {
 
 impl AsyncRead for Session {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> IoPoll<usize> {
-        let mybuf = pollerfwd!(self.as_mut().poll_fill_buf(cx));
+        let mybuf = ready!(self.as_mut().poll_fill_buf(cx)?);
         let len = std::cmp::min(buf.len(), mybuf.len());
         buf[..len].copy_from_slice(&mybuf[..len]);
         self.consume(len);
@@ -400,7 +391,7 @@ impl AsyncRead for Session {
 
 impl AsyncWrite for Session {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> IoPoll<usize> {
-        pollerfwd!(self.as_mut().poll_helper_write(cx, false));
+        ready!(self.as_mut().poll_helper_write(cx, false)?);
         // we can't simply do this before the partial flush,
         // because we can't 'roll back' in case of yielding or error
         self.buf_out.extend_from_slice(buf);
@@ -412,7 +403,7 @@ impl AsyncWrite for Session {
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<()> {
-        pollerfwd!(self.as_mut().poll_flush(cx));
+        ready!(self.as_mut().poll_flush(cx)?);
         Pin::new(&mut self.parent).poll_close(cx)
     }
 }
