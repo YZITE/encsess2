@@ -115,8 +115,8 @@ fn helper_send_packet(
 }
 
 #[inline]
-async fn flush_pts(pts: &mut PacketTcpStream) -> std::io::Result<()> {
-    poll_fn(move |cx| PacketStream::poll_flush(Pin::new(pts), cx)).await
+fn flush_pts(pts: &mut PacketTcpStream) -> impl Future<Output = std::io::Result<()>> + '_ {
+    poll_fn(move |cx| PacketStream::poll_flush(Pin::new(pts), cx))
 }
 
 pub struct Session {
