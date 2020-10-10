@@ -166,7 +166,7 @@ async fn handle_client(
     match yz_encsess::Session::new(stream, yzconfig).await {
         Err(x) => eprintln!("[ERROR] {}: session setup failed with: {}", peer_addr, x),
         Ok(x) => {
-            let clpubkey = base64::encode(x.get_remote_static().unwrap_or(&[]));
+            let clpubkey = base64::encode(x.remote_static_pubkey().unwrap_or(&[]));
             let mut peer_name = String::new();
             if svconfig.client.is_empty() {
                 eprintln!(

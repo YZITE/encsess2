@@ -89,15 +89,6 @@ fn finish_builder_with_side(
 
 type PacketTcpStream = PacketStream<TcpStream>;
 
-pub struct Session {
-    parent: PacketTcpStream,
-    config: Arc<Config>,
-    state: SessionState,
-
-    buf_in: Vec<u8>,
-    buf_out: Vec<u8>,
-}
-
 #[inline]
 pub fn generate_keypair() -> Result<snow::Keypair, snow::Error> {
     Ok(snow::Builder::new(NOISE_PARAMS.clone()).generate_keypair()?)
@@ -137,6 +128,15 @@ async fn flush_pts(pts: &mut PacketTcpStream) -> std::io::Result<()> {
     poll_fn(move |cx| PacketStream::poll_flush(Pin::new(pts), cx)).await
 }
 
+pub struct Session {
+    parent: PacketTcpStream,
+    config: Arc<Config>,
+    state: SessionState,
+
+    buf_in: Vec<u8>,
+    buf_out: Vec<u8>,
+}
+
 impl Session {
     pub async fn new(stream: TcpStream, config: Arc<Config>) -> std::io::Result<Session> {
         let mut builder =
@@ -161,12 +161,25 @@ impl Session {
         Ok(this)
     }
 
+    /// Tries to extract the remote party's static public key from the noise state.
     #[inline]
-    pub fn get_remote_static(&self) -> Option<&[u8]> {
+    pub fn remote_static_pubkey(&self) -> Option<&[u8]> {
         match &self.state {
             SessionState::Transport(x, _) => x.get_remote_static(),
             SessionState::Handshake(x) => x.get_remote_static(),
         }
+    }
+
+    /// Returns the local address this stream is bound to.
+    #[inline]
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.parent.get_ref().local_addr()
+    }
+
+    /// Returns the remote address this stream is connected to.
+    #[inline]
+    pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.parent.get_ref().peer_addr()
     }
 
     async fn helper_fill_bufin(&mut self) -> std::io::Result<()> {
