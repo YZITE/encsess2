@@ -267,26 +267,23 @@ impl Session {
         // perform all state transitions;
         // this function is reentrant, because the state of our state machine is
         // put into self.state
-        enum PostAction {
-            Flush,
-            FillBuffIn,
-            Handshake,
-            Done,
-        };
-
         loop {
-            let post_act = match std::mem::replace(&mut self.state, SessionState::InFlight) {
+            ready!(match std::mem::replace(&mut self.state, SessionState::InFlight) {
                 SessionState::Transport(mut tr, TrSubState::Transport)
                     if tr.sending_nonce() >= MAX_NONCE_VALUE =>
                 {
                     helper_send_packet(&mut self.parent, &mut tr, &[])?;
                     self.state = SessionState::Transport(tr, TrSubState::ScheduledHandshake);
-                    PostAction::Flush
+                    Pin::new(&mut self.parent).poll_flush(cx)
                 }
 
                 x @ SessionState::Transport(_, TrSubState::Transport) => {
                     self.state = x;
-                    PostAction::Done
+                    if let SessionState::Transport(tr, _) = &mut self.state {
+                        return Poll::Ready(Ok(tr));
+                    } else {
+                        unreachable!("internal error in poll_cont_pending")
+                    }
                 }
 
                 SessionState::Transport(tr, TrSubState::ScheduledHandshake) => {
@@ -297,7 +294,7 @@ impl Session {
                         );
                     }
                     self.state = SessionState::Transport(tr, TrSubState::ScheduledHandshake);
-                    PostAction::FillBuffIn
+                    self.poll_helper_fill_bufin(cx)
                 }
 
                 SessionState::Transport(tr, TrSubState::Handshake) => {
@@ -326,30 +323,15 @@ impl Session {
 
                 x @ SessionState::Handshake(_) => {
                     self.state = x;
-                    PostAction::Handshake
-                }
-
-                SessionState::InFlight => unreachable!("tried to manipulate poisoned session"),
-            };
-
-            ready!(match post_act {
-                PostAction::Flush => Pin::new(&mut self.parent).poll_flush(cx),
-                PostAction::FillBuffIn => self.poll_helper_fill_bufin(cx),
-                PostAction::Handshake => {
                     if let SessionState::Handshake(noise) = &mut self.state {
                         poll_helper_handshake(&mut self.parent, noise, cx)
                     } else {
                         unreachable!("internal error in poll_cont_pending");
                     }
                 }
-                PostAction::Done => {
-                    if let SessionState::Transport(tr, TrSubState::Transport) = &mut self.state {
-                        return Poll::Ready(Ok(tr));
-                    } else {
-                        unreachable!("internal error in poll_cont_pending")
-                    }
-                }
-            }?)
+
+                SessionState::InFlight => unreachable!("tried to manipulate poisoned session"),
+            }?);
         }
     }
 
