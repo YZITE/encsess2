@@ -20,6 +20,7 @@ type IoPoll<T> = Poll<io::Result<T>>;
 
 const MAX_U16LEN: usize = 0xffff;
 const PACKET_MAX_LEN: usize = MAX_U16LEN - 20 - 1;
+const MAX_NONCE_VALUE: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Zeroize)]
 enum Side {
@@ -216,8 +217,6 @@ impl Session {
     }
 
     fn poll_cont_pending(&mut self, cx: &mut Context<'_>) -> IoPoll<()> {
-        const MAX_NONCE_VALUE: u64 = 10;
-
         // perform all state transitions
         loop {
             let config = &self.config;
