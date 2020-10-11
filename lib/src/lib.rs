@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
 use async_net::TcpStream;
-use futures_lite::{pin as pin_mut, ready, AsyncBufRead, AsyncRead, AsyncWrite, StreamExt};
+use futures_lite::{ready, AsyncBufRead, AsyncRead, AsyncWrite, Stream};
 use futures_micro::poll_fn;
 use std::task::{Context, Poll};
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{io, pin::Pin, sync::Arc};
 use tracing::debug;
 use yz_packet_stream::PacketStream;
 use zeroize::{Zeroize, Zeroizing};
@@ -16,7 +16,7 @@ lazy_static::lazy_static! {
       = "Noise_KK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
 }
 
-type IoPoll<T> = Poll<std::io::Result<T>>;
+type IoPoll<T> = Poll<io::Result<T>>;
 
 const MAX_U16LEN: usize = 0xffff;
 const PACKET_MAX_LEN: usize = MAX_U16LEN - 20 - 1;
@@ -63,14 +63,14 @@ enum SessionState {
 }
 
 #[inline(always)]
-fn trf_err2io(x: snow::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, x)
+fn trf_err2io(x: snow::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, x)
 }
 
 fn finish_builder_with_side(
     builder: snow::Builder<'_>,
     side: Side,
-) -> std::io::Result<snow::HandshakeState> {
+) -> io::Result<snow::HandshakeState> {
     match side {
         Side::Initiator => builder.build_initiator(),
         Side::Responder => builder.build_responder(),
@@ -89,7 +89,7 @@ fn helper_send_packet(
     pktstream: &mut PacketTcpStream,
     tr: &mut snow::TransportState,
     pktbuf: &[u8],
-) -> std::io::Result<usize> {
+) -> io::Result<usize> {
     const PAD_TRG_SIZE: usize = 64;
     use std::convert::TryInto;
     let inner_len = std::cmp::min(pktbuf.len(), PACKET_MAX_LEN);
@@ -114,11 +114,6 @@ fn helper_send_packet(
     Ok(inner_len)
 }
 
-#[inline]
-fn flush_pts(pts: &mut PacketTcpStream) -> impl Future<Output = std::io::Result<()>> + '_ {
-    poll_fn(move |cx| PacketStream::poll_flush(Pin::new(pts), cx))
-}
-
 pub struct Session {
     parent: PacketTcpStream,
     config: Arc<Config>,
@@ -129,7 +124,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub async fn new(stream: TcpStream, config: Arc<Config>) -> std::io::Result<Session> {
+    pub async fn new(stream: TcpStream, config: Arc<Config>) -> io::Result<Session> {
         let mut builder =
             snow::Builder::new(NOISE_PARAMS.clone()).local_private_key(&config.privkey[..]);
         if let SideConfig::Client { ref server_pubkey } = &config.side {
@@ -147,7 +142,7 @@ impl Session {
         };
 
         // perform handshake without code duplication
-        this.cont_pending_intern().await?;
+        poll_fn(|cx| this.poll_cont_pending(cx)).await?;
 
         Ok(this)
     }
@@ -163,19 +158,19 @@ impl Session {
 
     /// Returns the local address this stream is bound to.
     #[inline]
-    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.parent.get_ref().local_addr()
     }
 
     /// Returns the remote address this stream is connected to.
     #[inline]
-    pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.parent.get_ref().peer_addr()
     }
 
-    async fn helper_fill_bufin(&mut self) -> std::io::Result<()> {
+    fn poll_helper_fill_bufin(&mut self, cx: &mut Context<'_>) -> IoPoll<()> {
         if let SessionState::Transport(ref mut tr, ref mut substate) = &mut self.state {
-            if let Some(blob) = self.parent.next().await {
+            if let Some(blob) = ready!(Pin::new(&mut self.parent).poll_next(cx)) {
                 let mut buf_in = Vec::with_capacity(MAX_U16LEN);
                 buf_in.resize(MAX_U16LEN, 0);
                 let len = tr
@@ -187,10 +182,10 @@ impl Session {
                 debug!("got len = {}, inner_len = {}", len, inner_len);
                 if inner_len > (len - 2) {
                     // do not panic if out-of-bounds
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
                         "inner length out of bounds",
-                    ));
+                    )));
                 }
                 if inner_len == 0 {
                     // got a token.
@@ -200,7 +195,7 @@ impl Session {
                             // we didn't sent a token ourselves, do it now
                             // we don't need to clear the output buffer
                             helper_send_packet(&mut self.parent, tr, &[])?;
-                            flush_pts(&mut self.parent).await?;
+                            ready!(Pin::new(&mut self.parent).poll_flush(cx)?);
                         }
                         TSS::ScheduledHandshake => {
                             // we already sent a token ourselves, do nothing
@@ -217,10 +212,10 @@ impl Session {
                 }
             }
         }
-        Ok(())
+        Poll::Ready(Ok(()))
     }
 
-    async fn cont_pending_intern(&mut self) -> std::io::Result<()> {
+    fn poll_cont_pending(&mut self, cx: &mut Context<'_>) -> IoPoll<()> {
         const MAX_NONCE_VALUE: u64 = 10;
 
         // perform all state transitions
@@ -272,11 +267,11 @@ impl Session {
 
             match &mut self.state {
                 SessionState::Handshake(ref mut noise) => {
-                    // any `.await?` might yield and nuke `tmp`
+                    // any `ready!` might yield and nuke `tmp`
                     let mut tmp = [0u8; MAX_U16LEN];
                     loop {
                         // this might yield, but that's ok
-                        flush_pts(&mut self.parent).await?;
+                        ready!(Pin::new(&mut self.parent).poll_flush(cx)?);
                         if noise.is_handshake_finished() {
                             break;
                         } else if noise.is_my_turn() {
@@ -287,17 +282,19 @@ impl Session {
                             Pin::new(&mut self.parent).enqueue(&tmp[..len])?;
                         } else {
                             // this line might yield and nuke `tmp`
-                            let _ = match self.parent.next().await {
-                                Some(x) => noise
-                                    .read_message(&(x?)[..], &mut tmp[..])
-                                    .map_err(trf_err2io)?,
-                                None => {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::UnexpectedEof,
-                                        "eof while handshaking",
-                                    ))
+                            match ready!(Pin::new(&mut self.parent).poll_next(cx)) {
+                                Some(x) => {
+                                    let _ = noise
+                                        .read_message(&(x?)[..], &mut tmp[..])
+                                        .map_err(trf_err2io)?;
                                 }
-                            };
+                                None => {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "eof while handshaking",
+                                    )));
+                                }
+                            }
                         }
                     }
                 }
@@ -306,20 +303,14 @@ impl Session {
                     // because we have no yield point between setting and checking it
                     if need2send_token {
                         helper_send_packet(&mut self.parent, tr, &[])?;
-                        flush_pts(&mut self.parent).await?;
+                        ready!(Pin::new(&mut self.parent).poll_flush(cx)?);
                     }
                     // we need to wait until we get a token from the other peer
-                    self.helper_fill_bufin().await?;
+                    ready!(self.poll_helper_fill_bufin(cx)?);
                 }
-                _ => return Ok(()),
+                _ => return Poll::Ready(Ok(())),
             }
         }
-    }
-
-    fn poll_cont_pending(&mut self, cx: &mut Context<'_>) -> IoPoll<()> {
-        let fut = self.cont_pending_intern();
-        pin_mut!(fut);
-        fut.poll(cx)
     }
 
     fn poll_helper_write(
@@ -360,11 +351,7 @@ impl AsyncBufRead for Session {
         let this = Pin::into_inner(self);
         while this.buf_in.is_empty() {
             ready!(this.poll_cont_pending(cx)?);
-            {
-                let fut = this.helper_fill_bufin();
-                pin_mut!(fut);
-                ready!(fut.poll(cx)?);
-            }
+            ready!(this.poll_helper_fill_bufin(cx)?);
             if let SessionState::Transport(_, TrSubState::Transport) = &this.state {
                 break;
             }
