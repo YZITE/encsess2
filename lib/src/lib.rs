@@ -223,23 +223,22 @@ impl Session {
             let config = &self.config;
             let parent = &self.parent;
             let mut need2send_token = false;
-            take_mut::take(&mut self.state, |state| match state {
-                SessionState::Transport(tr, TrSubState::Transport)
+            match &mut self.state {
+                SessionState::Transport(tr, ref mut subst @ TrSubState::Transport)
                     if tr.sending_nonce() >= MAX_NONCE_VALUE =>
                 {
                     need2send_token = true;
-                    SessionState::Transport(tr, TrSubState::ScheduledHandshake)
+                    *subst = TrSubState::ScheduledHandshake;
                 }
                 SessionState::Transport(tr, TrSubState::Transport)
                     if tr.receiving_nonce() == (MAX_NONCE_VALUE + 1) =>
                 {
                     tracing::warn!("expected handshake token from other peer, but didn't get one");
-                    SessionState::Transport(tr, TrSubState::Transport)
                 }
 
                 SessionState::Transport(tr, TrSubState::Handshake) => {
                     debug!("begin handshake with {:?}", parent);
-                    SessionState::Handshake(
+                    self.state = SessionState::Handshake(
                         finish_builder_with_side(
                             snow::Builder::new(NOISE_PARAMS_REHS.clone())
                                 .local_private_key(&config.privkey[..])
@@ -247,19 +246,26 @@ impl Session {
                             config.side.side(),
                         )
                         .expect("unable to build HandshakeState"),
-                    )
+                    );
                 }
 
                 SessionState::Handshake(hs) if hs.is_handshake_finished() => {
                     debug!("finish handshake with {:?}", parent);
-                    SessionState::Transport(
-                        hs.into_transport_mode()
-                            .expect("unable to build TransportState"),
-                        TrSubState::Transport,
-                    )
+                    take_mut::take(&mut self.state, |state| {
+                        let (tr, subst) = match state {
+                            SessionState::Handshake(hs) => (
+                                hs.into_transport_mode()
+                                    .expect("unable to build TransportState"),
+                                TrSubState::Transport,
+                            ),
+                            SessionState::Transport(tr, subst) => (tr, subst),
+                        };
+                        SessionState::Transport(tr, subst)
+                    });
                 }
-                x => x,
-            });
+
+                _ => {}
+            }
 
             // we can now deal with a state which doesn't need to change
             // this function is reentrant, because the state of our state machine is
