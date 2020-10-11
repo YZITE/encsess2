@@ -268,19 +268,20 @@ impl Session {
         // this function is reentrant, because the state of our state machine is
         // put into self.state
         loop {
-            ready!(match std::mem::replace(&mut self.state, SessionState::InFlight) {
+            let res = match std::mem::replace(&mut self.state, SessionState::InFlight) {
                 SessionState::Transport(mut tr, TrSubState::Transport)
                     if tr.sending_nonce() >= MAX_NONCE_VALUE =>
                 {
-                    match helper_send_packet(&mut self.parent, &mut tr, &[]) {
-                        Ok(_) => {
-                            self.state = SessionState::Transport(tr, TrSubState::ScheduledHandshake);
-                        }
-                        Err(e) => {
-                            self.state = SessionState::Transport(tr, TrSubState::Transport);
-                            return Poll::Ready(Err(e));
-                        }
-                    }
+                    let res = helper_send_packet(&mut self.parent, &mut tr, &[]);
+                    self.state = SessionState::Transport(
+                        tr,
+                        if res.is_ok() {
+                            TrSubState::ScheduledHandshake
+                        } else {
+                            TrSubState::Transport
+                        },
+                    );
+                    let _ = res?;
                     Pin::new(&mut self.parent).poll_flush(cx)
                 }
 
@@ -338,7 +339,9 @@ impl Session {
                 }
 
                 SessionState::InFlight => unreachable!("tried to manipulate poisoned session"),
-            }?);
+            };
+
+            ready!(res?);
         }
     }
 
