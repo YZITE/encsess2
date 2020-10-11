@@ -60,10 +60,7 @@ enum TrSubState {
 
 enum SessionState {
     Transport(snow::TransportState, TrSubState),
-    Handshake(snow::HandshakeState),
-
-    // this value is only possible if the Session panic'ed
-    InFlight,
+    Handshake(Option<snow::HandshakeState>),
 }
 
 #[inline(always)]
@@ -173,7 +170,8 @@ impl Session {
             builder = builder.remote_public_key(server_pubkey);
         }
 
-        let state = SessionState::Handshake(finish_builder_with_side(builder, config.side.side())?);
+        let state =
+            SessionState::Handshake(Some(finish_builder_with_side(builder, config.side.side())?));
 
         let mut this = Session {
             parent: PacketStream::new(stream),
@@ -198,8 +196,10 @@ impl Session {
     pub fn remote_static_pubkey(&self) -> Option<&[u8]> {
         match &self.state {
             SessionState::Transport(x, _) => x.get_remote_static(),
-            SessionState::Handshake(x) => x.get_remote_static(),
-            SessionState::InFlight => unreachable!(),
+            SessionState::Handshake(Some(x)) => x.get_remote_static(),
+            SessionState::Handshake(None) => {
+                unreachable!("tried to interact with poisoned session")
+            }
         }
     }
 
@@ -268,30 +268,17 @@ impl Session {
         // this function is reentrant, because the state of our state machine is
         // put into self.state
         loop {
-            let res = match std::mem::replace(&mut self.state, SessionState::InFlight) {
-                SessionState::Transport(mut tr, TrSubState::Transport)
+            let res = match &mut self.state {
+                SessionState::Transport(ref mut tr, subst @ TrSubState::Transport)
                     if tr.sending_nonce() >= MAX_NONCE_VALUE =>
                 {
-                    let res = helper_send_packet(&mut self.parent, &mut tr, &[]);
-                    self.state = SessionState::Transport(
-                        tr,
-                        if res.is_ok() {
-                            TrSubState::ScheduledHandshake
-                        } else {
-                            TrSubState::Transport
-                        },
-                    );
-                    let _ = res?;
+                    helper_send_packet(&mut self.parent, tr, &[])?;
+                    *subst = TrSubState::ScheduledHandshake;
                     Pin::new(&mut self.parent).poll_flush(cx)
                 }
 
-                x @ SessionState::Transport(_, TrSubState::Transport) => {
-                    self.state = x;
-                    if let SessionState::Transport(tr, _) = &mut self.state {
-                        return Poll::Ready(Ok(tr));
-                    } else {
-                        unreachable!("internal error in poll_cont_pending")
-                    }
+                SessionState::Transport(_, TrSubState::Transport) => {
+                    break;
                 }
 
                 SessionState::Transport(tr, TrSubState::ScheduledHandshake) => {
@@ -301,13 +288,12 @@ impl Session {
                             "expected handshake token from other peer, but didn't get one"
                         );
                     }
-                    self.state = SessionState::Transport(tr, TrSubState::ScheduledHandshake);
                     self.poll_helper_fill_bufin(cx)
                 }
 
                 SessionState::Transport(tr, TrSubState::Handshake) => {
                     debug!("begin handshake with {:?}", &self.parent);
-                    self.state = SessionState::Handshake(
+                    self.state = SessionState::Handshake(Some(
                         finish_builder_with_side(
                             snow::Builder::new(NOISE_PARAMS_REHS.clone())
                                 .local_private_key(&self.config.privkey[..])
@@ -315,33 +301,40 @@ impl Session {
                             self.config.side.side(),
                         )
                         .expect("unable to build HandshakeState"),
-                    );
+                    ));
                     continue;
                 }
 
-                SessionState::Handshake(hs) if hs.is_handshake_finished() => {
+                SessionState::Handshake(hs @ Some(_))
+                    if hs.as_ref().unwrap().is_handshake_finished() =>
+                {
                     debug!("finish handshake with {:?}", &self.parent);
                     self.state = SessionState::Transport(
-                        hs.into_transport_mode()
+                        hs.take()
+                            .unwrap()
+                            .into_transport_mode()
                             .expect("unable to build TransportState"),
                         TrSubState::Transport,
                     );
                     continue;
                 }
 
-                x @ SessionState::Handshake(_) => {
-                    self.state = x;
-                    if let SessionState::Handshake(noise) = &mut self.state {
-                        poll_helper_handshake(&mut self.parent, noise, cx)
-                    } else {
-                        unreachable!("internal error in poll_cont_pending");
-                    }
+                SessionState::Handshake(Some(noise)) => {
+                    poll_helper_handshake(&mut self.parent, noise, cx)
                 }
 
-                SessionState::InFlight => unreachable!("tried to manipulate poisoned session"),
+                SessionState::Handshake(None) => {
+                    unreachable!("tried to manipulate poisoned session")
+                }
             };
 
             ready!(res?);
+        }
+
+        if let SessionState::Transport(tr, TrSubState::Transport) = &mut self.state {
+            return Poll::Ready(Ok(tr));
+        } else {
+            unreachable!("bug in cont_pending helper: expected yield, got invalid state");
         }
     }
 
@@ -361,15 +354,10 @@ impl Session {
         );
         while this.buf_out.len() > threshold {
             // cont_pending calls flush if necessary
-            ready!(this.poll_cont_pending(cx)?);
-
-            if let SessionState::Transport(ref mut tr, TrSubState::Transport) = &mut this.state {
-                let inner_len = helper_send_packet(&mut this.parent, tr, &this.buf_out[..])?;
-                let _ = this.buf_out.drain(..inner_len);
-                sent_new_data = true;
-            } else {
-                unreachable!("bug in cont_pending helper: expected yield, got invalid state");
-            }
+            let tr = ready!(this.poll_cont_pending(cx)?);
+            let inner_len = helper_send_packet(&mut this.parent, tr, &this.buf_out[..])?;
+            let _ = this.buf_out.drain(..inner_len);
+            sent_new_data = true;
         }
         if sent_new_data {
             ready!(Pin::new(&mut this.parent).poll_flush(cx)?);
