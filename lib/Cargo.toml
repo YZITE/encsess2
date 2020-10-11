@@ -10,7 +10,6 @@ futures-lite = "1.0"
 futures-micro = "0.3"
 lazy_static = "1.4"
 rand = "0.7"
-take_mut = "0.2"
 tracing = "0.1"
 zeroize = "1.1"
 

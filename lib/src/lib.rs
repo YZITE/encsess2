@@ -61,6 +61,9 @@ enum TrSubState {
 enum SessionState {
     Transport(snow::TransportState, TrSubState),
     Handshake(snow::HandshakeState),
+
+    // this value is only possible if the Session panic'ed
+    InFlight,
 }
 
 #[inline(always)]
@@ -115,6 +118,44 @@ fn helper_send_packet(
     Ok(inner_len)
 }
 
+fn poll_helper_handshake(
+    pktstream: &mut PacketTcpStream,
+    noise: &mut snow::HandshakeState,
+    cx: &mut Context<'_>,
+) -> IoPoll<()> {
+    let mut pktstream = Pin::new(pktstream);
+    // any `ready!` might yield and nuke `tmp`
+    let mut tmp = [0u8; MAX_U16LEN];
+    loop {
+        // this might yield, but that's ok
+        ready!(pktstream.as_mut().poll_flush(cx)?);
+        if noise.is_handshake_finished() {
+            return Poll::Ready(Ok(()));
+        } else if noise.is_my_turn() {
+            let len = noise
+                .write_message(&[], &mut tmp[..])
+                .expect("unable to create noise handshake message");
+            // this might yield if err, but the item won't get lost
+            pktstream.as_mut().enqueue(&tmp[..len])?;
+        } else {
+            // this line might yield and nuke `tmp`, but we don't need it anyways
+            match ready!(pktstream.as_mut().poll_next(cx)) {
+                Some(x) => {
+                    let _ = noise
+                        .read_message(&(x?)[..], &mut tmp[..])
+                        .map_err(trf_err2io)?;
+                }
+                None => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "eof while handshaking",
+                    )));
+                }
+            }
+        }
+    }
+}
+
 pub struct Session {
     parent: PacketTcpStream,
     config: Arc<Config>,
@@ -143,7 +184,11 @@ impl Session {
         };
 
         // perform handshake without code duplication
-        poll_fn(|cx| this.poll_cont_pending(cx)).await?;
+        poll_fn(|cx| {
+            ready!(this.poll_cont_pending(cx)?);
+            Poll::Ready(io::Result::Ok(()))
+        })
+        .await?;
 
         Ok(this)
     }
@@ -154,6 +199,7 @@ impl Session {
         match &self.state {
             SessionState::Transport(x, _) => x.get_remote_static(),
             SessionState::Handshake(x) => x.get_remote_static(),
+            SessionState::InFlight => unreachable!(),
         }
     }
 
@@ -207,8 +253,8 @@ impl Session {
                             unreachable!("got a token while preparing for handshake, missing call to cont_pending?");
                         }
                     }
-                    // NOTE: we need to check the substate in poll_fill_buf to be sure
-                    // to not return EOF when we are in the Handshake substate
+                // NOTE: we need to check the substate in poll_fill_buf to be sure
+                // to not return EOF when we are in the Handshake substate
                 } else {
                     self.buf_in.extend_from_slice(&(&buf_in[2..])[..inner_len]);
                 }
@@ -217,101 +263,93 @@ impl Session {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_cont_pending(&mut self, cx: &mut Context<'_>) -> IoPoll<()> {
-        // perform all state transitions
+    fn poll_cont_pending(&mut self, cx: &mut Context<'_>) -> IoPoll<&mut snow::TransportState> {
+        // perform all state transitions;
+        // this function is reentrant, because the state of our state machine is
+        // put into self.state
+        enum PostAction {
+            Flush,
+            FillBuffIn,
+            Handshake,
+            Done,
+        };
+
         loop {
-            let config = &self.config;
-            let parent = &self.parent;
-            match &mut self.state {
-                SessionState::Transport(ref mut tr, ref mut subst @ TrSubState::Transport)
+            let post_act = match std::mem::replace(&mut self.state, SessionState::InFlight) {
+                SessionState::Transport(mut tr, TrSubState::Transport)
                     if tr.sending_nonce() >= MAX_NONCE_VALUE =>
                 {
-                    // we don't need to save $need2send_token in TrSubState,
-                    // because we have no yield point between setting and checking it
-                    *subst = TrSubState::ScheduledHandshake;
-                    helper_send_packet(&mut self.parent, tr, &[])?;
-                    ready!(Pin::new(&mut self.parent).poll_flush(cx)?);
+                    helper_send_packet(&mut self.parent, &mut tr, &[])?;
+                    self.state = SessionState::Transport(tr, TrSubState::ScheduledHandshake);
+                    PostAction::Flush
+                }
+
+                x @ SessionState::Transport(_, TrSubState::Transport) => {
+                    self.state = x;
+                    PostAction::Done
                 }
 
                 SessionState::Transport(tr, TrSubState::ScheduledHandshake) => {
                     // we need to wait until we get a token from the other peer
                     if tr.receiving_nonce() == (MAX_NONCE_VALUE + 1) {
-                        tracing::warn!("expected handshake token from other peer, but didn't get one");
+                        tracing::warn!(
+                            "expected handshake token from other peer, but didn't get one"
+                        );
                     }
-                    ready!(self.poll_helper_fill_bufin(cx)?);
+                    self.state = SessionState::Transport(tr, TrSubState::ScheduledHandshake);
+                    PostAction::FillBuffIn
                 }
 
                 SessionState::Transport(tr, TrSubState::Handshake) => {
-                    debug!("begin handshake with {:?}", parent);
+                    debug!("begin handshake with {:?}", &self.parent);
                     self.state = SessionState::Handshake(
                         finish_builder_with_side(
                             snow::Builder::new(NOISE_PARAMS_REHS.clone())
-                                .local_private_key(&config.privkey[..])
+                                .local_private_key(&self.config.privkey[..])
                                 .remote_public_key(tr.get_remote_static().unwrap()),
-                            config.side.side(),
+                            self.config.side.side(),
                         )
                         .expect("unable to build HandshakeState"),
                     );
+                    continue;
                 }
 
                 SessionState::Handshake(hs) if hs.is_handshake_finished() => {
-                    debug!("finish handshake with {:?}", parent);
-                    take_mut::take(&mut self.state, |state| {
-                        let (tr, subst) = match state {
-                            SessionState::Handshake(hs) => (
-                                hs.into_transport_mode()
-                                    .expect("unable to build TransportState"),
-                                TrSubState::Transport,
-                            ),
-                            SessionState::Transport(tr, subst) => (tr, subst),
-                        };
-                        SessionState::Transport(tr, subst)
-                    });
+                    debug!("finish handshake with {:?}", &self.parent);
+                    self.state = SessionState::Transport(
+                        hs.into_transport_mode()
+                            .expect("unable to build TransportState"),
+                        TrSubState::Transport,
+                    );
+                    continue;
                 }
 
-                _ => {}
-            }
+                x @ SessionState::Handshake(_) => {
+                    self.state = x;
+                    PostAction::Handshake
+                }
 
-            // we can now deal with a state which doesn't need to change
-            // this function is reentrant, because the state of our state machine is
-            // put into self.state
+                SessionState::InFlight => unreachable!("tried to manipulate poisoned session"),
+            };
 
-            match &mut self.state {
-                SessionState::Handshake(ref mut noise) => {
-                    // any `ready!` might yield and nuke `tmp`
-                    let mut tmp = [0u8; MAX_U16LEN];
-                    loop {
-                        // this might yield, but that's ok
-                        ready!(Pin::new(&mut self.parent).poll_flush(cx)?);
-                        if noise.is_handshake_finished() {
-                            break;
-                        } else if noise.is_my_turn() {
-                            let len = noise
-                                .write_message(&[], &mut tmp[..])
-                                .expect("unable to create noise handshake message");
-                            // this might yield if err, but the item won't get lost
-                            Pin::new(&mut self.parent).enqueue(&tmp[..len])?;
-                        } else {
-                            // this line might yield and nuke `tmp`
-                            match ready!(Pin::new(&mut self.parent).poll_next(cx)) {
-                                Some(x) => {
-                                    let _ = noise
-                                        .read_message(&(x?)[..], &mut tmp[..])
-                                        .map_err(trf_err2io)?;
-                                }
-                                None => {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "eof while handshaking",
-                                    )));
-                                }
-                            }
-                        }
+            ready!(match post_act {
+                PostAction::Flush => Pin::new(&mut self.parent).poll_flush(cx),
+                PostAction::FillBuffIn => self.poll_helper_fill_bufin(cx),
+                PostAction::Handshake => {
+                    if let SessionState::Handshake(noise) = &mut self.state {
+                        poll_helper_handshake(&mut self.parent, noise, cx)
+                    } else {
+                        unreachable!("internal error in poll_cont_pending");
                     }
                 }
-                SessionState::Transport(_, TrSubState::ScheduledHandshake) | SessionState::Transport(_, TrSubState::Handshake) => {}
-                SessionState::Transport(_, TrSubState::Transport) => return Poll::Ready(Ok(())),
-            }
+                PostAction::Done => {
+                    if let SessionState::Transport(tr, TrSubState::Transport) = &mut self.state {
+                        return Poll::Ready(Ok(tr));
+                    } else {
+                        unreachable!("internal error in poll_cont_pending")
+                    }
+                }
+            }?)
         }
     }
 
