@@ -272,8 +272,15 @@ impl Session {
                 SessionState::Transport(mut tr, TrSubState::Transport)
                     if tr.sending_nonce() >= MAX_NONCE_VALUE =>
                 {
-                    helper_send_packet(&mut self.parent, &mut tr, &[])?;
-                    self.state = SessionState::Transport(tr, TrSubState::ScheduledHandshake);
+                    match helper_send_packet(&mut self.parent, &mut tr, &[]) {
+                        Ok(_) => {
+                            self.state = SessionState::Transport(tr, TrSubState::ScheduledHandshake);
+                        }
+                        Err(e) => {
+                            self.state = SessionState::Transport(tr, TrSubState::Transport);
+                            return Poll::Ready(Err(e));
+                        }
+                    }
                     Pin::new(&mut self.parent).poll_flush(cx)
                 }
 
