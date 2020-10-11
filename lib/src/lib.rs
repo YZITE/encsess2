@@ -195,11 +195,13 @@ impl Session {
                         TSS::Transport => {
                             // we didn't sent a token ourselves, do it now
                             // we don't need to clear the output buffer
+                            *substate = TSS::Handshake;
                             helper_send_packet(&mut self.parent, tr, &[])?;
                             ready!(Pin::new(&mut self.parent).poll_flush(cx)?);
                         }
                         TSS::ScheduledHandshake => {
                             // we already sent a token ourselves, do nothing
+                            *substate = TSS::Handshake;
                         }
                         TSS::Handshake => {
                             unreachable!("got a token while preparing for handshake, missing call to cont_pending?");
@@ -207,7 +209,6 @@ impl Session {
                     }
                     // NOTE: we need to check the substate in poll_fill_buf to be sure
                     // to not return EOF when we are in the Handshake substate
-                    *substate = TSS::Handshake;
                 } else {
                     self.buf_in.extend_from_slice(&(&buf_in[2..])[..inner_len]);
                 }
@@ -221,18 +222,23 @@ impl Session {
         loop {
             let config = &self.config;
             let parent = &self.parent;
-            let mut need2send_token = false;
             match &mut self.state {
-                SessionState::Transport(tr, ref mut subst @ TrSubState::Transport)
+                SessionState::Transport(ref mut tr, ref mut subst @ TrSubState::Transport)
                     if tr.sending_nonce() >= MAX_NONCE_VALUE =>
                 {
-                    need2send_token = true;
+                    // we don't need to save $need2send_token in TrSubState,
+                    // because we have no yield point between setting and checking it
                     *subst = TrSubState::ScheduledHandshake;
+                    helper_send_packet(&mut self.parent, tr, &[])?;
+                    ready!(Pin::new(&mut self.parent).poll_flush(cx)?);
                 }
-                SessionState::Transport(tr, TrSubState::Transport)
-                    if tr.receiving_nonce() == (MAX_NONCE_VALUE + 1) =>
-                {
-                    tracing::warn!("expected handshake token from other peer, but didn't get one");
+
+                SessionState::Transport(tr, TrSubState::ScheduledHandshake) => {
+                    // we need to wait until we get a token from the other peer
+                    if tr.receiving_nonce() == (MAX_NONCE_VALUE + 1) {
+                        tracing::warn!("expected handshake token from other peer, but didn't get one");
+                    }
+                    ready!(self.poll_helper_fill_bufin(cx)?);
                 }
 
                 SessionState::Transport(tr, TrSubState::Handshake) => {
@@ -303,17 +309,8 @@ impl Session {
                         }
                     }
                 }
-                SessionState::Transport(ref mut tr, TrSubState::ScheduledHandshake) => {
-                    // we don't need to save $need2send_token in TrSubState,
-                    // because we have no yield point between setting and checking it
-                    if need2send_token {
-                        helper_send_packet(&mut self.parent, tr, &[])?;
-                        ready!(Pin::new(&mut self.parent).poll_flush(cx)?);
-                    }
-                    // we need to wait until we get a token from the other peer
-                    ready!(self.poll_helper_fill_bufin(cx)?);
-                }
-                _ => return Poll::Ready(Ok(())),
+                SessionState::Transport(_, TrSubState::ScheduledHandshake) | SessionState::Transport(_, TrSubState::Handshake) => {}
+                SessionState::Transport(_, TrSubState::Transport) => return Poll::Ready(Ok(())),
             }
         }
     }
