@@ -263,7 +263,7 @@ impl Session {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_cont_pending(&mut self, cx: &mut Context<'_>) -> IoPoll<&mut snow::TransportState> {
+    fn poll_cont_pending(&mut self, cx: &mut Context<'_>) -> IoPoll<()> {
         // perform all state transitions;
         // this function is reentrant, because the state of our state machine is
         // put into self.state
@@ -278,7 +278,7 @@ impl Session {
                 }
 
                 SessionState::Transport(_, TrSubState::Transport) => {
-                    break;
+                    break Poll::Ready(Ok(()));
                 }
 
                 SessionState::Transport(tr, TrSubState::ScheduledHandshake) => {
@@ -330,12 +330,6 @@ impl Session {
 
             ready!(res?);
         }
-
-        if let SessionState::Transport(tr, TrSubState::Transport) = &mut self.state {
-            return Poll::Ready(Ok(tr));
-        } else {
-            unreachable!("bug in cont_pending helper: expected yield, got invalid state");
-        }
     }
 
     fn poll_helper_write(
@@ -354,10 +348,14 @@ impl Session {
         );
         while this.buf_out.len() > threshold {
             // cont_pending calls flush if necessary
-            let tr = ready!(this.poll_cont_pending(cx)?);
-            let inner_len = helper_send_packet(&mut this.parent, tr, &this.buf_out[..])?;
-            let _ = this.buf_out.drain(..inner_len);
-            sent_new_data = true;
+            ready!(this.poll_cont_pending(cx)?);
+            if let SessionState::Transport(tr, TrSubState::Transport) = &mut this.state {
+                let inner_len = helper_send_packet(&mut this.parent, tr, &this.buf_out[..])?;
+                let _ = this.buf_out.drain(..inner_len);
+                sent_new_data = true;
+            } else {
+                unreachable!("bug in cont_pending helper: expected yield, got invalid state");
+            }
         }
         if sent_new_data {
             ready!(Pin::new(&mut this.parent).poll_flush(cx)?);
