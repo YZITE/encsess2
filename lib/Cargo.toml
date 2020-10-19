@@ -5,16 +5,16 @@ authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
 edition = "2018"
 
 [dependencies]
-async-net = "1.0"
-futures-lite = "1.0"
-futures-micro = "0.3"
+async-net = "1.4"
+futures-lite = "1.11"
+futures-micro = "0.3.1"
 lazy_static = "1.4"
 rand = "0.7"
 tracing = "0.1"
 zeroize = "1.1"
 
 [dependencies.snow]
-version = "0.7"
+version = "0.7.2"
 features = ["ring-accelerated"]
 
 [dependencies.yz-packet-stream]

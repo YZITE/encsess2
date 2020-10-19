@@ -155,8 +155,8 @@ async fn distribute(mut distr_out: async_channel::Receiver<DistrBlob>) {
     }
 }
 
-async fn handle_client(
-    ex: &Executor,
+async fn handle_client<'e>(
+    ex: &Executor<'e>,
     distr_in: async_channel::Sender<DistrBlob>,
     svconfig: &ServerConfig,
     yzconfig: Arc<yz_encsess::Config>,
