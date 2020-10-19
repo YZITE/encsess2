@@ -1,15 +1,19 @@
 #![forbid(unsafe_code)]
 
+mod keys;
+pub use keys::{new_key, Key, SecretKey};
+
 use async_net::TcpStream;
 use futures_lite::{ready, AsyncBufRead, AsyncRead, AsyncWrite, Stream};
 use futures_micro::poll_fn;
+pub use secrecy::ExposeSecret;
+use snow::params::NoiseParams;
 use std::task::{Context, Poll};
 use std::{io, pin::Pin, sync::Arc};
 use tracing::debug;
-use yz_packet_stream::PacketStream;
 pub use yz_glue_dhchoice::DHChoice;
+use yz_packet_stream::PacketStream;
 use zeroize::{Zeroize, Zeroizing};
-use snow::params::NoiseParams;
 
 fn resolve_noise_params(dhc: DHChoice, rehs: bool) -> NoiseParams {
     lazy_static::lazy_static! {
@@ -28,7 +32,8 @@ fn resolve_noise_params(dhc: DHChoice, rehs: bool) -> NoiseParams {
         (DHChoice::Ed25519, true) => &*NOISE_PARAMS_25519_REHS,
         (DHChoice::Ed448, false) => &*NOISE_PARAMS_448,
         (DHChoice::Ed448, true) => &*NOISE_PARAMS_448_REHS,
-    }.clone()
+    }
+    .clone()
 }
 
 type IoPoll<T> = Poll<io::Result<T>>;
@@ -47,7 +52,7 @@ enum Side {
 
 #[derive(Clone, Debug)]
 pub enum SideConfig {
-    Client { server_pubkey: Zeroizing<Vec<u8>> },
+    Client { server_pubkey: SecretKey },
     Server,
 }
 
@@ -62,7 +67,7 @@ impl SideConfig {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub privkey: Zeroizing<Vec<u8>>,
+    pub privkey: SecretKey,
     pub side: SideConfig,
     pub dhc: DHChoice,
 }
@@ -180,10 +185,10 @@ pub struct Session {
 
 impl Session {
     pub async fn new(stream: TcpStream, config: Arc<Config>) -> io::Result<Session> {
-        let mut builder =
-            snow::Builder::new(resolve_noise_params(config.dhc, false)).local_private_key(&config.privkey[..]);
+        let mut builder = snow::Builder::new(resolve_noise_params(config.dhc, false))
+            .local_private_key(&*config.privkey.expose_secret());
         if let SideConfig::Client { ref server_pubkey } = &config.side {
-            builder = builder.remote_public_key(server_pubkey);
+            builder = builder.remote_public_key(&*server_pubkey.expose_secret());
         }
 
         let state =
@@ -312,7 +317,7 @@ impl Session {
                     self.state = SessionState::Handshake(Some(
                         finish_builder_with_side(
                             snow::Builder::new(resolve_noise_params(self.config.dhc, true))
-                                .local_private_key(&self.config.privkey[..])
+                                .local_private_key(&*self.config.privkey.expose_secret())
                                 .remote_public_key(tr.get_remote_static().unwrap()),
                             self.config.side.side(),
                         )

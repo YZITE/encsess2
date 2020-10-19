@@ -8,6 +8,7 @@ use serde::Deserialize;
 use std::task::{Context, Poll};
 use std::{collections::HashMap, net::SocketAddr, pin::Pin, sync::Arc};
 use yzesd_zsittle::base64;
+use zeroize::Zeroize;
 
 struct DistrPeerData {
     sess: BiLock<yz_encsess::Session>,
@@ -102,13 +103,15 @@ async fn write_and_flush(v: &BiLock<yz_encsess::Session>, msg: &str) -> std::io:
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Zeroize)]
+#[zeroize(drop)]
 struct ConfigClient {
     pubkey: String,
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Zeroize)]
+#[zeroize(drop)]
 struct ServerConfig {
     listen: String,
     privkey: String,

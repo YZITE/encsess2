@@ -4,14 +4,24 @@ version = "0.1.0"
 authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
 edition = "2018"
 
+[features]
+serde = ["serde_x", "secrecy/serde", "yz-glue-dhchoice/serde"]
+
 [dependencies]
 async-net = "1.4"
 futures-lite = "1.11"
 futures-micro = "0.3.1"
 lazy_static = "1.4"
 rand = "0.7"
+secrecy = "0.7"
 tracing = "0.1"
+# the version below should match the version used by 'secrecy'
 zeroize = "1.1"
+
+[dependencies.serde_x]
+package = "serde"
+version = "1.0"
+optional = true
 
 [dependencies.snow]
 version = "0.7.2"

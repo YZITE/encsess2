@@ -19,6 +19,7 @@ tracing = "0.1"
 tracing-subscriber = "0.2.13"
 yz-encsess = { path = "../../lib" }
 yzesd-zsittle = { path = ".." }
+zeroize = "1.1"
 
 [dependencies.futures-util]
 version = "0.3.6"

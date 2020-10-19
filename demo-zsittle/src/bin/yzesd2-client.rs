@@ -32,9 +32,11 @@ fn main() {
     let config = Arc::new(yz_encsess::Config {
         privkey: yzesd_zsittle::get_private_key(cfgf.privkey.as_ref().map(String::as_str)).into(),
         side: yz_encsess::SideConfig::Client {
-            server_pubkey: base64::decode(&use_server.pubkey)
-                .expect("got invalid public key")
-                .into(),
+            server_pubkey: yz_encsess::new_key(
+                base64::decode(&use_server.pubkey)
+                    .expect("got invalid public key")
+                    .into(),
+            ),
         },
         dhc: yzesd_zsittle::DFL_DHC,
     });
