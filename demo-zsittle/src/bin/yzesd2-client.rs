@@ -36,6 +36,7 @@ fn main() {
                 .expect("got invalid public key")
                 .into(),
         },
+        dhc: yzesd_zsittle::DFL_DHC,
     });
 
     async_io::block_on(async move {

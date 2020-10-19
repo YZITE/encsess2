@@ -1,0 +1,18 @@
+[package]
+name = "yz-glue-dhchoice"
+version = "0.0.0"
+authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
+edition = "2018"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[dependencies.serde]
+version = "1.0"
+default-features = false
+features = ["derive"]
+optional = true
+
+[dependencies.snow]
+version = "0.7.2"
+default-features = false

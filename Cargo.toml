@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "glue-dhchoice",
   "lib",
   "demo-zsittle",
   "demo-zsittle/server",

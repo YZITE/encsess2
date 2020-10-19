@@ -236,6 +236,7 @@ fn main() {
     let yzconfig = Arc::new(yz_encsess::Config {
         privkey: yzesd_zsittle::get_private_key(Some(cfgf.privkey.as_str())).into(),
         side: yz_encsess::SideConfig::Server,
+        dhc: yzesd_zsittle::DFL_DHC,
     });
 
     let (s, ctrl_c) = async_channel::bounded(2);

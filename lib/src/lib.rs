@@ -7,13 +7,28 @@ use std::task::{Context, Poll};
 use std::{io, pin::Pin, sync::Arc};
 use tracing::debug;
 use yz_packet_stream::PacketStream;
+pub use yz_glue_dhchoice::DHChoice;
 use zeroize::{Zeroize, Zeroizing};
+use snow::params::NoiseParams;
 
-lazy_static::lazy_static! {
-    static ref NOISE_PARAMS: snow::params::NoiseParams
-      = "Noise_XK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-    static ref NOISE_PARAMS_REHS: snow::params::NoiseParams
-      = "Noise_KK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+fn resolve_noise_params(dhc: DHChoice, rehs: bool) -> NoiseParams {
+    lazy_static::lazy_static! {
+        static ref NOISE_PARAMS_25519: NoiseParams
+          = "Noise_XK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        static ref NOISE_PARAMS_25519_REHS: NoiseParams
+          = "Noise_KK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        static ref NOISE_PARAMS_448: NoiseParams
+          = "Noise_XK_448_ChaChaPoly_BLAKE2s".parse().unwrap();
+        static ref NOISE_PARAMS_448_REHS: NoiseParams
+          = "Noise_KK_448_ChaChaPoly_BLAKE2s".parse().unwrap();
+    };
+
+    match (dhc, rehs) {
+        (DHChoice::Ed25519, false) => &*NOISE_PARAMS_25519,
+        (DHChoice::Ed25519, true) => &*NOISE_PARAMS_25519_REHS,
+        (DHChoice::Ed448, false) => &*NOISE_PARAMS_448,
+        (DHChoice::Ed448, true) => &*NOISE_PARAMS_448_REHS,
+    }.clone()
 }
 
 type IoPoll<T> = Poll<io::Result<T>>;
@@ -49,6 +64,7 @@ impl SideConfig {
 pub struct Config {
     pub privkey: Zeroizing<Vec<u8>>,
     pub side: SideConfig,
+    pub dhc: DHChoice,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -82,8 +98,8 @@ fn finish_builder_with_side(
 type PacketTcpStream = PacketStream<TcpStream>;
 
 #[inline]
-pub fn generate_keypair() -> Result<snow::Keypair, snow::Error> {
-    Ok(snow::Builder::new(NOISE_PARAMS.clone()).generate_keypair()?)
+pub fn generate_keypair(dhc: DHChoice) -> Result<snow::Keypair, snow::Error> {
+    Ok(snow::Builder::new(resolve_noise_params(dhc, false)).generate_keypair()?)
 }
 
 fn helper_send_packet(
@@ -165,7 +181,7 @@ pub struct Session {
 impl Session {
     pub async fn new(stream: TcpStream, config: Arc<Config>) -> io::Result<Session> {
         let mut builder =
-            snow::Builder::new(NOISE_PARAMS.clone()).local_private_key(&config.privkey[..]);
+            snow::Builder::new(resolve_noise_params(config.dhc, false)).local_private_key(&config.privkey[..]);
         if let SideConfig::Client { ref server_pubkey } = &config.side {
             builder = builder.remote_public_key(server_pubkey);
         }
@@ -295,7 +311,7 @@ impl Session {
                     debug!("begin handshake with {:?}", &self.parent);
                     self.state = SessionState::Handshake(Some(
                         finish_builder_with_side(
-                            snow::Builder::new(NOISE_PARAMS_REHS.clone())
+                            snow::Builder::new(resolve_noise_params(self.config.dhc, true))
                                 .local_private_key(&self.config.privkey[..])
                                 .remote_public_key(tr.get_remote_static().unwrap()),
                             self.config.side.side(),

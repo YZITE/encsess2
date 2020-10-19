@@ -1,11 +1,12 @@
 #![forbid(deprecated, unsafe_code)]
 
 pub use base64;
+pub const DFL_DHC: yz_glue_dhchoice::DHChoice = yz_glue_dhchoice::DHChoice::Ed25519;
 
 pub fn get_private_key(inp: Option<&str>) -> Vec<u8> {
     match inp {
         None => {
-            let kp = yz_encsess::generate_keypair().expect("unable to generate keypair");
+            let kp = yz_encsess::generate_keypair(DFL_DHC).expect("unable to generate keypair");
             println!("generated keypair:");
             let mut tmp = base64::encode(&kp.private);
             println!("\tprivkey = \"{}\"", tmp);
