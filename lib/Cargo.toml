@@ -3,6 +3,7 @@ name = "yz-encsess"
 version = "0.1.0"
 authors = ["Erik Zscheile <zseri.devel@ytrizja.de>"]
 edition = "2018"
+license = "MIT"
 
 [features]
 serde = ["serde_x", "secrecy/serde", "yz-glue-dhchoice/serde"]
@@ -31,6 +32,12 @@ features = ["ring-accelerated"]
 version = "0.0"
 path = "../glue-dhchoice"
 
-[dependencies.yz-packet-stream]
-version = "0.2.1"
-features = ["tracing"]
+[dependencies.yz-futures-sink]
+version = "0.1"
+git = "https://github.com/YZITE/futures.git"
+branch = "main"
+
+[dependencies.yz-futures-codec]
+version = "0.0"
+git = "https://github.com/YZITE/futures.git"
+branch = "main"

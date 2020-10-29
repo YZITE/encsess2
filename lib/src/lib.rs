@@ -11,8 +11,9 @@ use snow::params::NoiseParams;
 use std::task::{Context, Poll};
 use std::{io, pin::Pin, sync::Arc};
 use tracing::debug;
+use yz_futures_codec::{codec, Framed};
+use yz_futures_sink::{FlushSink, Sink};
 pub use yz_glue_dhchoice::DHChoice;
-use yz_packet_stream::PacketStream;
 use zeroize::{Zeroize, Zeroizing};
 
 fn resolve_noise_params(dhc: DHChoice, rehs: bool) -> NoiseParams {
@@ -85,8 +86,19 @@ enum SessionState {
 }
 
 #[inline(always)]
-fn trf_err2io(x: snow::Error) -> io::Error {
+fn trfs_err2io(x: snow::Error) -> io::Error {
     io::Error::new(io::ErrorKind::Other, x)
+}
+
+#[inline(always)]
+fn trfc_err2io<U: std::error::Error + Send + Sync + 'static>(
+    x: yz_futures_codec::Error<U>,
+) -> io::Error {
+    use yz_futures_codec::Error;
+    match x {
+        Error::Codec(x) => io::Error::new(io::ErrorKind::Other, x),
+        Error::Io(io) => io,
+    }
 }
 
 fn finish_builder_with_side(
@@ -97,10 +109,10 @@ fn finish_builder_with_side(
         Side::Initiator => builder.build_initiator(),
         Side::Responder => builder.build_responder(),
     }
-    .map_err(trf_err2io)
+    .map_err(trfs_err2io)
 }
 
-type PacketTcpStream = PacketStream<TcpStream>;
+type PacketTcpStream = Framed<TcpStream, codec::Length<u16>>;
 
 #[inline]
 pub fn generate_keypair(dhc: DHChoice) -> Result<snow::Keypair, snow::Error> {
@@ -131,8 +143,10 @@ fn helper_send_packet(
     let mut tmp = [0u8; MAX_U16LEN];
     let len = tr
         .write_message(&inner_full[..], &mut tmp[..])
-        .map_err(trf_err2io)?;
-    Pin::new(pktstream).enqueue(&tmp[..len])?;
+        .map_err(trfs_err2io)?;
+    Pin::new(pktstream)
+        .start_send(&tmp[..len])
+        .map_err(trfc_err2io)?;
     Ok(inner_len)
 }
 
@@ -146,7 +160,8 @@ fn poll_helper_handshake(
     let mut tmp = [0u8; MAX_U16LEN];
     loop {
         // this might yield, but that's ok
-        ready!(pktstream.as_mut().poll_flush(cx)?);
+        ready!(pktstream.as_mut().poll_flush(cx).map_err(trfc_err2io)?);
+        ready!(pktstream.as_mut().poll_ready(cx).map_err(trfc_err2io)?);
         if noise.is_handshake_finished() {
             return Poll::Ready(Ok(()));
         } else if noise.is_my_turn() {
@@ -154,14 +169,17 @@ fn poll_helper_handshake(
                 .write_message(&[], &mut tmp[..])
                 .expect("unable to create noise handshake message");
             // this might yield if err, but the item won't get lost
-            pktstream.as_mut().enqueue(&tmp[..len])?;
+            pktstream
+                .as_mut()
+                .start_send(&tmp[..len])
+                .map_err(trfc_err2io)?;
         } else {
             // this line might yield and nuke `tmp`, but we don't need it anyways
             match ready!(pktstream.as_mut().poll_next(cx)) {
                 Some(x) => {
                     let _ = noise
-                        .read_message(&(x?)[..], &mut tmp[..])
-                        .map_err(trf_err2io)?;
+                        .read_message(&(x.map_err(trfc_err2io)?)[..], &mut tmp[..])
+                        .map_err(trfs_err2io)?;
                 }
                 None => {
                     return Poll::Ready(Err(io::Error::new(
@@ -195,7 +213,7 @@ impl Session {
             SessionState::Handshake(Some(finish_builder_with_side(builder, config.side.side())?));
 
         let mut this = Session {
-            parent: PacketStream::new(stream),
+            parent: Framed::new(stream, codec::Length::new()),
             config,
             state,
             buf_in: Vec::new(),
@@ -227,23 +245,28 @@ impl Session {
     /// Returns the local address this stream is bound to.
     #[inline]
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
-        self.parent.get_ref().local_addr()
+        self.parent.local_addr()
     }
 
     /// Returns the remote address this stream is connected to.
     #[inline]
     pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
-        self.parent.get_ref().peer_addr()
+        self.parent.peer_addr()
     }
 
     fn poll_helper_fill_bufin(&mut self, cx: &mut Context<'_>) -> IoPoll<()> {
         if let SessionState::Transport(ref mut tr, ref mut substate) = &mut self.state {
+            // the following might yield, we don't want
+            // to have any state outside of self at this point
+            ready!(Pin::new(&mut self.parent)
+                .poll_ready(cx)
+                .map_err(trfc_err2io)?);
             if let Some(blob) = ready!(Pin::new(&mut self.parent).poll_next(cx)) {
                 let mut buf_in = Vec::with_capacity(MAX_U16LEN);
                 buf_in.resize(MAX_U16LEN, 0);
                 let len = tr
-                    .read_message(&(blob?)[..], &mut buf_in[..])
-                    .map_err(trf_err2io)?;
+                    .read_message(&(blob.map_err(trfc_err2io)?)[..], &mut buf_in[..])
+                    .map_err(trfs_err2io)?;
                 let mut inner_len = [0u8; 2usize];
                 inner_len.copy_from_slice(&buf_in[..2]);
                 let inner_len: usize = u16::from_be_bytes(inner_len).into();
@@ -263,8 +286,11 @@ impl Session {
                             // we didn't sent a token ourselves, do it now
                             // we don't need to clear the output buffer
                             *substate = TSS::Handshake;
+                            // we can do this bc at the top of this fn we called poll_ready
                             helper_send_packet(&mut self.parent, tr, &[])?;
-                            ready!(Pin::new(&mut self.parent).poll_flush(cx)?);
+                            ready!(Pin::new(&mut self.parent)
+                                .poll_flush(cx)
+                                .map_err(trfc_err2io)?);
                         }
                         TSS::ScheduledHandshake => {
                             // we already sent a token ourselves, do nothing
@@ -293,9 +319,15 @@ impl Session {
                 SessionState::Transport(ref mut tr, subst @ TrSubState::Transport)
                     if tr.sending_nonce() >= MAX_NONCE_VALUE =>
                 {
+                    // we can call this bc we won't change $nonce if we yield here
+                    ready!(Pin::new(&mut self.parent)
+                        .poll_ready(cx)
+                        .map_err(trfc_err2io)?);
                     helper_send_packet(&mut self.parent, tr, &[])?;
                     *subst = TrSubState::ScheduledHandshake;
-                    Pin::new(&mut self.parent).poll_flush(cx)
+                    Pin::new(&mut self.parent)
+                        .poll_flush(cx)
+                        .map_err(trfc_err2io)
                 }
 
                 SessionState::Transport(_, TrSubState::Transport) => {
@@ -358,7 +390,6 @@ impl Session {
         cx: &mut Context<'_>,
         do_full_flush: bool,
     ) -> IoPoll<()> {
-        // we know about the PacketStream interna and know we don't need to wait for readyness.
         let this = Pin::into_inner(self);
         let threshold = if do_full_flush { 0 } else { PACKET_MAX_LEN - 1 };
         let mut sent_new_data = false;
@@ -379,7 +410,9 @@ impl Session {
             }
         }
         if sent_new_data {
-            ready!(Pin::new(&mut this.parent).poll_flush(cx)?);
+            ready!(Pin::new(&mut this.parent)
+                .poll_flush(cx)
+                .map_err(trfc_err2io)?);
         }
         Poll::Ready(Ok(()))
     }
@@ -430,6 +463,8 @@ impl AsyncWrite for Session {
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> IoPoll<()> {
         ready!(self.as_mut().poll_flush(cx)?);
-        Pin::new(&mut self.parent).poll_close(cx)
+        Pin::new(&mut self.parent)
+            .poll_close(cx)
+            .map_err(trfc_err2io)
     }
 }
